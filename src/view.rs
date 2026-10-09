@@ -48,7 +48,8 @@ pub struct Live {
 enum Style {
   #[default]
   Plain,
-  Sent,
+  Bold,
+  Faint,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -108,18 +109,22 @@ impl Line {
       queue!(out, SetAttribute(Attribute::Reset))?;
       return Ok(());
     }
-    let mut text = self.text.as_str();
-    if self.style == Style::Sent
-      && let Some(rest) = text.strip_prefix('┃')
-    {
-      out.write_all("┃".as_bytes())?;
-      text = rest;
+    match self.style {
+      Style::Plain => {}
+      Style::Bold => queue!(out, SetAttribute(Attribute::Bold))?,
+      Style::Faint => queue!(out, SetAttribute(Attribute::Dim))?,
     }
-    if self.style == Style::Sent {
-      queue!(out, SetAttribute(Attribute::Bold))?;
-    }
-    write!(out, "{text}{}", SetAttribute(Attribute::Reset))?;
+    write!(out, "{}{}", self.text, SetAttribute(Attribute::Reset))?;
     Ok(())
+  }
+}
+
+// One cell short of the edge, like the editor, so drawing it never triggers a wrap.
+fn rule(cols: u16) -> Line {
+  Line {
+    text: "─".repeat(usize::from(cols.saturating_sub(1))),
+    style: Style::Faint,
+    ..Line::default()
   }
 }
 
@@ -132,8 +137,9 @@ fn wrap(text: &str, cols: u16, first: &str, rest: &str, style: Style) -> Vec<Lin
   layout.rows.into_iter().map(|row| Line { text: row.text, style, ..Line::default() }).collect()
 }
 
-fn block(text: &str, cols: u16, style: Style) -> Vec<Line> {
-  if text.is_empty() { Vec::new() } else { wrap(text, cols, "  ", "  ", style) }
+// Summaries and notices are meta, not copy targets: faint and indented.
+fn meta(text: &str, cols: u16) -> Vec<Line> {
+  if text.is_empty() { Vec::new() } else { wrap(text, cols, "  ", "  ", Style::Faint) }
 }
 
 fn preview_lines(text: &Text, cols: u16) -> Res<Vec<Line>> {
@@ -259,12 +265,8 @@ pub fn header(out: &mut impl Write) -> Res<()> {
 }
 
 pub fn separator(out: &mut impl Write, cols: u16) -> Res<()> {
-  write!(
-    out,
-    "\r{}{}",
-    SetAttribute(Attribute::Reset),
-    "─".repeat(usize::from(cols.saturating_sub(1)))
-  )?;
+  out.write_all(b"\r")?;
+  rule(cols).write(out)?;
   out.flush()?;
   Ok(())
 }
@@ -466,14 +468,15 @@ impl Live {
     Ok(())
   }
 
-  pub fn prompt(&mut self, out: &mut impl Write, text: &str, cols: u16) -> Res<()> {
+  // Bold marks the user's role without a colour. The terminal wraps it, so a selection copies only
+  // the user's own line breaks; no prefix or frame enters the clipboard.
+  pub fn prompt(&mut self, out: &mut impl Write, text: &str) -> Res<()> {
     let mut bytes = Vec::new();
     self.patch(&mut bytes, &[], (0, 0))?;
-    for line in wrap(&clean(text, 0).0, cols, "┃ ", "┃ ", Style::Sent) {
-      line.write(&mut bytes)?;
-      write!(bytes, "\r\n")?;
-    }
-    write!(bytes, "\r\n")?;
+    queue!(bytes, SetAttribute(Attribute::Reset), SetAttribute(Attribute::Bold))?;
+    write!(bytes, "{}", clean(text, 0).0.replace('\n', "\r\n"))?;
+    queue!(bytes, SetAttribute(Attribute::Reset))?;
+    write!(bytes, "\r\n\r\n")?;
     update(out, bytes, self.sync)?;
     self.lines.clear();
     self.cursor = (0, 0);
@@ -486,7 +489,7 @@ impl Live {
   pub fn message(&mut self, out: &mut impl Write, text: &str, cols: u16) -> Res<()> {
     let mut bytes = Vec::new();
     self.patch(&mut bytes, &[], (0, 0))?;
-    for line in wrap(&clean(text, 0).0, cols, "* ", "  ", Style::Plain) {
+    for line in meta(&clean(text, 0).0, cols) {
       line.write(&mut bytes)?;
       write!(bytes, "\r\n")?;
     }
@@ -587,7 +590,7 @@ impl Live {
       lines.push(Line::default());
     }
     if let Some(summary) = nonempty(summary) {
-      lines.extend(block(&summary, cols, Style::Plain));
+      lines.extend(meta(&summary, cols));
       lines.push(Line::default());
     }
     lines.push(Line::default());
@@ -617,19 +620,19 @@ fn footer(
   let label = notice.unwrap_or(status);
   let label = clean(label, 0).0;
   let menu = menu.filter(|_| notice.is_none());
+  // Rules frame the editor once the input and status fit; the lower one also tops the menu.
+  let ruled = budget >= 4;
+  let frame = 2 * usize::from(ruled);
   let mut status = if let Some(menu) = menu {
-    menu_lines(menu, cols, budget.saturating_sub(1))
+    menu_lines(menu, cols, budget - 1 - frame)
   } else {
     let mut status = wrap(&label, cols, "", "", Style::Plain);
-    status.truncate(usize::from(budget >= 3));
+    status.truncate(usize::from(budget >= 2));
     status
   };
-  let gap = usize::from(menu.is_none() && !status.is_empty());
-  let available = budget - status.len() - gap;
-  let mut lines: Vec<_> = messages
-    .iter()
-    .flat_map(|message| wrap(&clean(message, 0).0, cols, "* ", "  ", Style::Plain))
-    .collect();
+  let available = budget - status.len() - frame;
+  let mut lines: Vec<_> =
+    messages.iter().flat_map(|message| meta(&clean(message, 0).0, cols)).collect();
   let limit = available.saturating_sub(2);
   if lines.len() > limit {
     lines.drain(..lines.len() - limit);
@@ -637,8 +640,11 @@ fn footer(
   if !lines.is_empty() {
     lines.push(Line::default());
   }
+  let count = layout.rows.len().min(available - lines.len());
+  if ruled {
+    lines.push(rule(cols));
+  }
   let lead = lines.len();
-  let count = layout.rows.len().min(available - lead);
   let start = cursor.0.saturating_sub(count - 1).min(layout.rows.len() - count);
   lines.extend(layout.rows.into_iter().skip(start).take(count).map(|row| {
     let mut marks = Vec::new();
@@ -655,8 +661,8 @@ fn footer(
     }
     Line { text: row.text, marks, ..Line::default() }
   }));
-  if gap > 0 {
-    lines.push(Line::default());
+  if ruled {
+    lines.push(rule(cols));
   }
   lines.append(&mut status);
   (lines, (lead + cursor.0 - start, cursor.1))
@@ -687,19 +693,18 @@ fn menu_lines(menu: &Menu, cols: u16, budget: usize) -> Vec<Line> {
     return Vec::new();
   }
   let width = usize::from(cols.saturating_sub(1).max(1));
-  let full = budget >= 6;
-  let visible = (if full { budget - 5 } else { budget }).min(VISIBLE).min(menu.items.len().max(1));
+  // A full menu sits below the editor's lower rule, which serves as its top border.
+  let full = budget >= 5;
+  let visible = (if full { budget - 4 } else { budget }).min(VISIBLE).min(menu.items.len().max(1));
   let start = menu.offset.min(menu.selected).max((menu.selected + 1).saturating_sub(visible));
   let end = (start + visible).min(menu.items.len());
   let line = |text: &str, selected| Line {
     text: clip(text, width),
-    style: if selected { Style::Sent } else { Style::Plain },
+    style: if selected { Style::Bold } else { Style::Plain },
     ..Line::default()
   };
-  let border = "─".repeat(width);
   let mut lines = Vec::new();
   if full {
-    lines.push(line(&border, false));
     let mut title = format!("{} {}", menu.kind.title(), menu.items.len());
     if menu.kind == Kind::Effort {
       title.push_str(&format!(" · {}", menu.settings.model.name));
@@ -748,7 +753,7 @@ fn menu_lines(menu: &Menu, cols: u16, budget: usize) -> Vec<Line> {
     }
   }
   if full {
-    lines.push(line(&border, false));
+    lines.push(rule(cols));
     let hint = if matches!(menu.kind, Kind::Models | Kind::Effort) {
       "↑↓ navigate     →/tab complete     enter apply     esc close"
     } else {
@@ -793,6 +798,7 @@ mod tests {
     snapshots: Vec<String>,
     erased: Vec<usize>,
     prompt: bool,
+    coloured: bool,
     saved: Option<(usize, usize, bool)>,
   }
 
@@ -812,6 +818,7 @@ mod tests {
         snapshots: Vec::new(),
         erased: Vec::new(),
         prompt: false,
+        coloured: false,
         saved: None,
       }
     }
@@ -893,12 +900,20 @@ mod tests {
               continue;
             }
             if cmd == 'm' {
+              // Markdown may use classic palette foregrounds; never 256/RGB or backgrounds.
               assert!(
-                matches!(arg.as_str(), "0" | "1" | "3" | "4" | "9"),
-                "use terminal default colours"
+                matches!(
+                  arg.as_str(),
+                  "0" | "1" | "2" | "3" | "4" | "9" | "31" | "32" | "33" | "34" | "35" | "36"
+                ),
+                "unexpected SGR {arg}"
               );
+              if arg == "0" || arg.len() == 2 {
+                self.coloured = arg != "0";
+              }
               continue;
             }
+            assert!(!self.coloured, "colour leaked into the UI at {arg}{cmd}");
             let n: usize = if arg.is_empty() { 0 } else { arg.parse().unwrap() };
             self.pending = false;
             match cmd {
@@ -1066,7 +1081,7 @@ mod tests {
     let mut live = Live { redraw: true, sync: true, ..Live::default() };
     let mut screen = Screen::new(24);
     apply(&mut screen, |out| {
-      live.prompt(out, "HISTORY", 80).unwrap();
+      live.prompt(out, "HISTORY").unwrap();
       live.finish(out, "reply", None, 80).unwrap();
     });
     let mut input = Input::default();
@@ -1106,7 +1121,7 @@ mod tests {
       input.insert(&format!("message-{index:02}\nsecond line")).unwrap();
       apply(&mut screen, |out| live.draw(out, &frame(&input), 80, 8).unwrap());
       apply(&mut screen, |out| {
-        live.prompt(out, &input.text, 80).unwrap();
+        live.prompt(out, &input.text).unwrap();
         live.finish(out, &input.text, None, 80).unwrap();
       });
       input = Input::default();
@@ -1119,7 +1134,7 @@ mod tests {
     apply(&mut screen, |out| live.draw(out, &frame(&input), 80, 8).unwrap());
     input.pos -= 1;
     let delta = apply(&mut screen, |out| live.draw(out, &frame(&input), 80, 8).unwrap());
-    assert_eq!(delta, "\x1b[6G");
+    assert_eq!(delta, "\x1b[4G");
     assert!(apply(&mut screen, |out| live.draw(out, &frame(&input), 80, 8).unwrap()).is_empty());
     apply(&mut screen, |out| live.clear(out).unwrap());
     assert!(!screen.text().contains("next"));
@@ -1131,7 +1146,7 @@ mod tests {
     let mut live = Live { redraw: true, sync: true, ..Live::default() };
     let mut screen = Screen::new(53);
     apply(&mut screen, |out| {
-      live.prompt(out, "HISTORY", 119).unwrap();
+      live.prompt(out, "HISTORY").unwrap();
       live.finish(out, "HISTORY", None, 119).unwrap();
     });
     let mut input = Input::default();
@@ -1170,11 +1185,72 @@ mod tests {
   }
 
   #[test]
+  fn rules_frame_the_editor_and_its_lower_rule_tops_the_menu() {
+    let mut input = Input::default();
+    input.insert("draft").unwrap();
+    let texts = |lines: Vec<Line>| lines.into_iter().map(|line| line.text).collect::<Vec<_>>();
+    let rule = "─".repeat(39);
+    let (lines, cursor) = footer(&input, None, "echo", None, &[], 40, 12);
+    assert_eq!(texts(lines), [&rule, "draft", &rule, "echo"]);
+    assert_eq!(cursor, (1, 5));
+    assert_eq!(texts(footer(&input, None, "echo", None, &[], 40, 3).0), ["draft", "echo"]);
+
+    input = Input::default();
+    input.insert("$").unwrap();
+    let menu = Menu::open(&input, crate::model::Settings::default()).unwrap();
+    let lines = texts(footer(&input, None, "echo", Some(&menu), &[], 40, 12).0);
+    assert_eq!(lines[..3], [&rule, "$", &rule]);
+    assert!(lines[3].starts_with("Skills 8") && lines[3].ends_with("1–5"));
+    assert_eq!(lines.iter().filter(|line| **line == rule).count(), 3);
+  }
+
+  #[test]
+  fn submitted_messages_are_bold_and_copy_their_own_lines_after_resize() {
+    let paragraph = "Всего учтено 13 файлов, 4 584 строки и 395 пустых строк. ".repeat(3);
+    for text in [
+      format!("{paragraph}\n\n    **literal** 界e\u{301} 👩‍💻\nlast  "),
+      format!("{}\n{}\nlast", "x".repeat(80), "界".repeat(40)),
+    ] {
+      let mut live = Live { redraw: true, ..Live::default() };
+      let mut screen = Screen::new(24);
+      let output = apply(&mut screen, |out| live.prompt(out, &text).unwrap());
+      assert!(output.starts_with("\x1b[0m\x1b[1m") && output.ends_with("\x1b[0m\r\n\r\n"));
+      for cols in [80, 40, 120] {
+        screen.resize(cols, 24);
+        let mut selected = String::new();
+        for (i, line) in screen.lines.iter().enumerate() {
+          selected.push_str(line);
+          if !screen.wraps[i] {
+            selected.push('\n');
+          }
+        }
+        assert_eq!(selected.trim_end_matches('\n'), text, "width {cols}");
+      }
+    }
+  }
+
+  #[test]
+  fn summaries_and_notices_are_faint_and_indented() {
+    let mut live = Live::default();
+    let mut out = Vec::new();
+    live.finish(&mut out, "reply", Some("2s (↑1 ↓1)"), 80).unwrap();
+    live.message(&mut out, "Copied to clipboard.", 80).unwrap();
+    let output = String::from_utf8(out).unwrap();
+    assert!(output.contains("\x1b[0m\x1b[2m  2s (↑1 ↓1)\x1b[0m"));
+    assert!(output.contains("\x1b[0m\x1b[2m  Copied to clipboard.\x1b[0m"));
+
+    let messages = ["Copied to clipboard.".to_owned()];
+    let (lines, _) = footer(&Input::default(), None, "echo", None, &messages, 40, 12);
+    assert_eq!(lines[0].text, "  Copied to clipboard.");
+    assert!(lines[0].style == Style::Faint);
+  }
+
+  #[test]
   fn unsupported_resize_retains_history_without_reprinting_completed_turns() {
     let mut live = Live::default();
     let mut input = Input::default();
     let mut out = Vec::new();
-    live.prompt(&mut out, "kept", 80).unwrap();
+    live.prompt(&mut out, "kept").unwrap();
     live.finish(&mut out, "kept", None, 80).unwrap();
     input.insert("draft").unwrap();
     live.draw(&mut out, &frame(&input), 80, 24).unwrap();
@@ -1221,12 +1297,12 @@ mod tests {
     let mut screen = Screen::new(12);
     let mut input = Input::default();
     let paragraph = "paragraph-界-e\u{301}-👩‍💻 ".repeat(20).trim_end().to_owned();
-    let code = format!("    {}\n", "code-界-e\u{301}-👩‍💻 ".repeat(20)).repeat(8);
+    let code = format!("    let s = \"{}\";\n", "code-界-e\u{301}-👩‍💻 ".repeat(20)).repeat(8);
     let text =
       format!("# Title\n\n[**{paragraph}**](https://example.org)\n\n```rust\n{code}```\n\nnext");
     let mut response = String::new();
     let (mut cols, mut rows) = (80, 12);
-    apply(&mut screen, |out| live.prompt(out, "question", cols).unwrap());
+    let mut output = apply(&mut screen, |out| live.prompt(out, "question").unwrap());
     for (i, c) in text.chars().enumerate() {
       response.push(c);
       if i % 100 == 0 {
@@ -1238,11 +1314,14 @@ mod tests {
         screen.resize(cols, usize::from(rows));
         live.resize();
       }
-      apply(&mut screen, |out| {
+      output += &apply(&mut screen, |out| {
         live.draw(out, &Frame { response: &response, ..frame(&input) }, cols, rows).unwrap()
       });
     }
-    apply(&mut screen, |out| live.finish(out, &response, None, cols).unwrap());
+    output += &apply(&mut screen, |out| live.finish(out, &response, Some("1s"), cols).unwrap());
+    // Highlighted strings wrap natively; colours are classic SGR and reset before the summary.
+    assert!(["\x1b[34mTitle", "\x1b[35mlet", "\x1b[32m\"code"].iter().all(|s| output.contains(s)));
+    assert!(!output.contains("38;") && !output.contains("48;"));
     let mut selected = String::new();
     for (i, line) in screen.lines.iter().enumerate() {
       selected.push_str(line);
@@ -1252,7 +1331,7 @@ mod tests {
     }
     assert_eq!(
       selected.trim_end(),
-      format!("┃ question\n\nTitle\n\n{paragraph}\n\n─ rust ─────\n{code}────────\n\nnext")
+      format!("question\n\nTitle\n\n{paragraph}\n\n```rust\n{code}```\n\nnext\n\n  1s")
     );
   }
 
@@ -1265,7 +1344,7 @@ mod tests {
     let mut response = String::new();
     let messages = ["Copied to clipboard.".to_owned()];
     let (mut cols, mut rows) = (80, 12);
-    apply(&mut screen, |out| live.prompt(out, "original question", cols).unwrap());
+    apply(&mut screen, |out| live.prompt(out, "original question").unwrap());
     let waiting = Frame { activity: Some("• Thinking".into()), ..frame(&input) };
     apply(&mut screen, |out| live.draw(out, &waiting, cols, rows).unwrap());
     assert_eq!(screen.text().lines().nth(2), Some("• Thinking"));
@@ -1283,7 +1362,7 @@ mod tests {
       };
       apply(&mut screen, |out| live.draw(out, &frame, cols, rows).unwrap());
       if index >= 20 {
-        assert!(screen.text().contains("* Copied to clipboard."));
+        assert!(screen.text().contains("  Copied to clipboard."));
         assert!(screen.text().ends_with("echo"));
       }
     }
@@ -1296,9 +1375,9 @@ mod tests {
       assert_eq!(text.matches(&format!("line-{index:03}")).count(), 1);
     }
     assert_eq!(text.matches("next draft").count(), 1);
-    assert_eq!(text.matches("* Copied to clipboard.").count(), 1);
-    assert!(text.find("line-099").unwrap() < text.find("* Copied to clipboard.").unwrap());
-    assert!(text.find("* Copied to clipboard.").unwrap() < text.find("next draft").unwrap());
+    assert_eq!(text.matches("  Copied to clipboard.").count(), 1);
+    assert!(text.find("line-099").unwrap() < text.find("  Copied to clipboard.").unwrap());
+    assert!(text.find("  Copied to clipboard.").unwrap() < text.find("next draft").unwrap());
     assert_eq!(input.text, "next draft\nwith another line");
   }
 }

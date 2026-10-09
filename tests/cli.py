@@ -30,7 +30,7 @@ HOME, END = ESC + "[H", ESC + "[F"
 CSI = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
 OSC = re.compile(r"\x1b\]([^\x07\x1b]*)(?:\x07|\x1b\\)")
 STATUS = ESC + "[0mauto · echo · medium · ⚡︎" + ESC + "[0m"
-SUMMARY = re.compile(r"\x1b\[0m  (\d+s \(↑\d+ ↓\d+\))\x1b\[0m")
+SUMMARY = re.compile(r"\x1b\[0m\x1b\[2m  (\d+s \(↑\d+ ↓\d+\))\x1b\[0m")
 
 # Keep the controlling session alive after clankr exits. macOS revokes a PTY
 # slave when its session leader exits, preventing a subsequent tcgetattr.
@@ -80,7 +80,9 @@ def tokens(text):
             elif final == "u":
                 require(params in (">1", "<1"), f"Unexpected keyboard protocol: {match[0]!r}")
             elif final == "m":
-                require(params in ("0", "1", "3", "4", "9"), f"Use terminal default colours: {match[0]!r}")
+                # Markdown uses classic palette foregrounds only: no 256/RGB colours or backgrounds.
+                require(params in ("0", "1", "2", "3", "4", "9", "31", "32", "33", "34", "35", "36"),
+                        f"Unexpected text style or colour: {match[0]!r}")
             else:
                 require(final in "ABGm" and re.fullmatch(r"[0-9;]*", params),
                         f"Forbidden/unknown CSI (including screen clear): {match[0]!r}")
@@ -231,12 +233,13 @@ class Terminal:
         require(ESC + "[>1u" in self.output, "Enhanced keys not enabled")
         self.header = self.screen.display[0].rstrip()
         require(self.header.startswith(":: clankr v"), "Missing compact header")
-        require(self.screen.display[2].rstrip() == "┃", "Wrong initial input position")
-        require(not self.screen.display[3].strip()
-                and self.screen.display[4].startswith("auto · echo · medium ·"),
-                "Status must sit one blank row below the editor")
+        require(self.screen.cursor.y == 3 and self.screen.cursor.x == 0, "Wrong initial input position")
+        require(self.screen.display[2].startswith("─")
+                and self.screen.display[4].startswith("─")
+                and self.screen.display[5].startswith("auto · echo · medium ·"),
+                "Status must sit immediately below the lower input rule")
         require(self.screen.buffer[0][3].bold, "Header name must be bold")
-        for row, col in ((0, 0), (0, 7), (2, 0), (4, 0)):
+        for row, col in ((0, 0), (0, 7), (5, 0)):
             cell = self.screen.buffer[row][col]
             require(cell.fg == "default" and cell.bg == "default", "Use terminal default colours")
         require("Enter send" not in self.output and "Ctrl+C quit" not in self.output,
@@ -252,7 +255,7 @@ class Terminal:
 
     def menu(self, title):
         self.until(lambda: title in self.display and "esc close" in self.display
-                   and self.screen.display[self.screen.cursor.y].startswith("┃"), title)
+                   and self.screen.display[self.screen.cursor.y + 1].startswith("─"), title)
 
     def submit(self, expected, model="echo"):
         start = len(self.output)
@@ -261,16 +264,16 @@ class Terminal:
         def completed():
             match = SUMMARY.search(self.output[start:])
             return (match and ESC + "[0mauto · " + model in self.output[start + match.end():]
-                    and self.screen.display[self.screen.cursor.y].strip() == "┃")
+                    and self.screen.display[self.screen.cursor.y].strip() == "")
 
         self.until(completed, f"echo of {expected!r}", timeout=max(8, len(expected) / 160 + 3))
         summary = SUMMARY.search(self.output[start:])[1]
         rows = self.transcript.splitlines()
         end = max(i for i, row in enumerate(rows) if row == "  " + summary) - 1
         lines = expected.split("\n")
-        for prefix in ("", "┃ "):
+        for _ in range(2):
             # pyte normalizes combining marks when it builds terminal cells.
-            block = [unicodedata.normalize("NFC", (prefix + line.replace("\t", "    ")).rstrip())
+            block = [unicodedata.normalize("NFC", line.replace("\t", "    ").rstrip())
                      for line in lines]
             shown = [unicodedata.normalize("NFC", row) for row in rows[end - len(lines):end]]
             require(shown == block, f"Wrong submitted text or echo: {block!r}\n{shown!r}")
@@ -321,22 +324,26 @@ def tui(binary):
         text = "first line\n\nsecond line\n\nthird line"
         terminal.paste(text)
         terminal.until(lambda: "third line" in terminal.display, "multiline reference draft")
-        for row in range(2, 7):
-            require(terminal.screen.buffer[row][0].data == "┃"
-                    and terminal.screen.buffer[row][0].fg == "default",
-                    "Input line must continue through blank rows using the default colour")
-        require(not terminal.screen.buffer[2][2].bold, "Draft text must not be bold")
+        require(terminal.screen.display[2].startswith("─")
+                and terminal.screen.display[8].startswith("─"), "Multiline input needs two rules")
+        require(not terminal.screen.buffer[3][0].bold, "Draft text must not be bold")
         summary = terminal.submit(text)
-        expected = ["┃ first line", "┃", "┃ second line", "┃", "┃ third line", "",
+        rule = "─" * (terminal.size[0] - 1)
+        expected = ["first line", "", "second line", "", "third line", "",
                     "first line", "", "second line", "", "third line", "",
-                    "  " + summary, "", "┃", ""]
-        require([row.rstrip() for row in terminal.screen.display[2:18]] == expected,
+                    "  " + summary, "", rule, "", rule]
+        require([row.rstrip() for row in terminal.screen.display[2:19]] == expected,
                 "Conversation spacing differs from the supplied reference")
-        require(terminal.screen.display[18].startswith("auto · echo · medium ·")
-                and "/272k " in terminal.screen.display[18], "Missing mock context usage")
-        require(terminal.screen.buffer[2][2].bold, "Sent input must be bold")
-        require(not terminal.screen.buffer[8][2].bold, "Answer text must remain regular")
-        require(terminal.screen.buffer[8][2].fg == "default", "Answer must use terminal text colour")
+        require(terminal.screen.display[19].startswith("auto · echo · medium ·")
+                and "/272k " in terminal.screen.display[19], "Missing mock context usage")
+        for row in range(20):
+            for cell in terminal.screen.buffer[row].values():
+                require(cell.bg == "default" and cell.fg == "default",
+                        "Conversation colors must follow the terminal theme, including history")
+        require(ESC + "[0m" + ESC + "[1mfirst line\r\n\r\nsecond line" in terminal.output,
+                "Submitted text must be bold and wrapped by the terminal")
+        require(terminal.screen.buffer[2][0].bold, "Submitted text must be bold")
+        require(not terminal.screen.buffer[8][0].bold, "Answer text must remain regular")
         terminal.paste("HISTORY-SEED")
         terminal.submit("HISTORY-SEED")
         terminal.send("first" + ESC + "[13;2u" + "second" + ESC + "\r" + "third")
@@ -403,7 +410,7 @@ def tui(binary):
     require(result.returncode == 1 and b"needs a terminal" in result.stderr,
             "Redirected launch did not return a useful error")
     require(b"\x1b" not in result.stdout + result.stderr, "Redirected launch changed terminal modes")
-    print("PASS tui: mock Thinking/Generating, blinking activity, tokens/context, cancellation, exit confirmation, reference layout, default colours, echo, multiline keys, Unicode, history, resize, terminal cleanup, non-TTY error")
+    print("PASS tui: mock Thinking/Generating, blinking activity, tokens/context, cancellation, exit confirmation, reference layout, default colors, input rules, echo, multiline keys, Unicode, history, resize, terminal cleanup, non-TTY error")
 
 
 def mock_lifecycle(binary):
@@ -413,20 +420,23 @@ def mock_lifecycle(binary):
         terminal.paste("hi!")
         start = len(terminal.output)
         terminal.send("\r")
-        terminal.until(lambda: "• Thinking (0s) (↑1 ↓0)" in terminal.display, "mock thinking")
-        require(terminal.screen.display[2].rstrip() == "┃ hi!", "Submitted prompt moved")
+        terminal.until(lambda: "• Thinking (0s) (↑1 ↓0)" in terminal.display
+                       and terminal.screen.cursor.y == 7
+                       and terminal.screen.display[9].startswith("auto · echo"), "mock thinking")
+        require(terminal.screen.display[2].rstrip() == "hi!", "Submitted prompt moved")
         require(terminal.screen.display[4].startswith("• Thinking"), "Activity differs from cast")
-        require(terminal.screen.display[6].rstrip() == "┃", "Draft must remain below activity")
+        require(terminal.screen.display[6].startswith("─") and terminal.screen.display[7].rstrip() == ""
+                and terminal.screen.display[8].startswith("─"), "Draft must remain below activity")
         terminal.until(lambda: terminal.screen.display[4].startswith("  Thinking"), "blinking dot")
         terminal.paste("next draft")
         terminal.send("\r")
         terminal.until(lambda: "Generating (1s)" in terminal.display, "mock generation")
         terminal.until(lambda: "(↑1 ↓1)" in terminal.display, "live token counter")
-        require("┃ next draft" in terminal.display, "Generation swallowed the next draft")
+        require("next draft" in terminal.display, "Generation swallowed the next draft")
         terminal.until(lambda: SUMMARY.search(terminal.output[start:])
                        and "2/272k 0%" in terminal.display, "final mock statistics and status")
         require("(↑1 ↓1)" in SUMMARY.search(terminal.output[start:])[1], "Wrong final counts")
-        require("\nhi!\n" in terminal.display and "┃ next draft" in terminal.display,
+        require("\nhi!\n" in terminal.display and "next draft" in terminal.display,
                 "Final answer or next draft lost")
         require("2/272k 0%" in terminal.display, "Context count missing after completion")
         require("Thinking" not in terminal.display and "Generating" not in terminal.display,
@@ -442,8 +452,9 @@ def mock_lifecycle(binary):
             terminal.send(ESC)
             terminal.until(lambda: "Cancelled ·" in terminal.display
                            and "Thinking" not in terminal.display
-                           and "Generating" not in terminal.display, "cancelled mock request")
-            require("┃ preserved" in terminal.display, "Cancellation lost the next draft")
+                           and "Generating" not in terminal.display
+                           and "2/272k 0%" in terminal.display, "cancelled mock request")
+            require("preserved" in terminal.display, "Cancellation lost the next draft")
             require("2/272k 0%" in terminal.display, "Cancelled turn changed completed context")
             terminal.send("\x15")
 
@@ -452,10 +463,10 @@ def mock_lifecycle(binary):
         terminal.until(lambda: "press ctrl+c again to exit" not in terminal.display,
                        "exit confirmation timeout")
         terminal.paste("still here")
-        terminal.until(lambda: "┃ still here" in terminal.display, "draft after exit timeout")
+        terminal.until(lambda: "still here" in terminal.display, "draft after exit timeout")
         terminal.send("\x03")
         terminal.until(lambda: "still here" not in terminal.display
-                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃"
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == ""
                        and "press ctrl+c again to exit" in terminal.display,
                        "ctrl+c clears the draft and shows the exit hint in an existing session")
         terminal.exit("\x03")
@@ -468,19 +479,22 @@ def menus(binary):
     try:
         terminal.ready()
         terminal.send("/copy\r")
-        terminal.until(lambda: "* No assistant reply to copy." in terminal.display
-                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃"
+        terminal.until(lambda: "  No assistant reply to copy." in terminal.display
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == ""
                        and "auto · echo · medium" in terminal.display, "copy message above the editor")
         message_row = next(i for i, row in enumerate(terminal.screen.display)
-                           if row.startswith("* No assistant reply to copy."))
+                           if row.startswith("  No assistant reply to copy."))
         require(message_row < terminal.screen.cursor.y, "Clipboard feedback replaced the status")
+        # pyte drops SGR 2, so check the stream: notices are faint meta lines.
+        require(ESC + "[0m" + ESC + "[2m  No assistant reply to copy." in terminal.output,
+                "Clipboard feedback must be faint")
         terminal.send("draft")
-        terminal.until(lambda: "┃ draft" in terminal.display, "typing after copy feedback")
-        require("* No assistant reply to copy." in terminal.display,
+        terminal.until(lambda: "draft" in terminal.display, "typing after copy feedback")
+        require("  No assistant reply to copy." in terminal.display,
                 "Clipboard feedback disappeared from history")
         terminal.send("\x03")
-        terminal.until(lambda: "┃ draft" not in terminal.display
-                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃"
+        terminal.until(lambda: "draft" not in terminal.display
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == ""
                        and "press ctrl+c again to exit" in terminal.display,
                        "ctrl+c clears the fresh draft and shows the exit hint")
         terminal.exit("\x03")
@@ -496,14 +510,14 @@ def menus(binary):
         require("/fast" in terminal.display and "/copy" in terminal.display, "Missing fast/copy commands")
         require("/help" not in terminal.display and "agent-rules" not in terminal.display,
                 "Slash menu must contain commands only, without help")
-        require(terminal.screen.display[2].rstrip() == "┃ /", "Menu moved above the editor")
-        require(terminal.screen.display[3].startswith("─"), "Missing menu divider")
+        require(terminal.screen.display[3].rstrip() == "/", "Menu moved above the editor")
+        require(terminal.screen.display[4].startswith("─"), "Missing menu divider")
         terminal.send("cl" + RIGHT)
-        terminal.until(lambda: "Commands" not in terminal.display and "┃ /clear" in terminal.display,
+        terminal.until(lambda: "Commands" not in terminal.display and "/clear" in terminal.display,
                        "Right completes the command without running it")
         terminal.send("\r")
         terminal.until(lambda: terminal.screen.display[0].rstrip() == terminal.header
-                       and terminal.screen.display[2].rstrip() == "┃", "clear command")
+                       and terminal.screen.cursor.y == 3 and terminal.screen.display[3].rstrip() == "", "clear command")
 
         terminal.send("huj! $age")
         terminal.menu("Skills 3")
@@ -511,13 +525,13 @@ def menus(binary):
                 "Dollar picker must contain skills only")
         terminal.send(DOWN + RIGHT)
         terminal.until(lambda: "Skills" not in terminal.display
-                       and "┃ huj! $agent-rules" in terminal.display, "Right completes the picked skill")
+                       and "huj! $agent-rules" in terminal.display, "Right completes the picked skill")
         row = terminal.screen.cursor.y
-        require(terminal.screen.buffer[row][7].bold, "Picked skill must be visually distinct")
+        require(terminal.screen.buffer[row][5].bold, "Picked skill must be visually distinct")
         terminal.send("yes")
-        terminal.until(lambda: "┃ huj! $agent-rules yes" in terminal.display, "typing after a skill")
+        terminal.until(lambda: "huj! $agent-rules yes" in terminal.display, "typing after a skill")
         terminal.send("\x7f" * 5)
-        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃ huj!",
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "huj!",
                        "whole skill deletion")
         terminal.send("\x15")
         terminal.paste("copy paste $agent-rules? 1221e")
@@ -529,7 +543,7 @@ def menus(binary):
         terminal.send("\x15")
         terminal.paste("$agent-rules")
         terminal.send("\x7f")
-        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃ $agent-rule",
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "$agent-rule",
                        "pasted names delete as ordinary text")
         terminal.send("\x15$")
         terminal.menu("Skills 8")
@@ -542,20 +556,20 @@ def menus(binary):
         for cols, rows in ((40, 12), (2, 2), (1, 1), (119, 53)):
             terminal.resize(cols, rows)
         terminal.send("\t")
-        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃ $planning",
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "$planning",
                        "Tab chooses the skill after resize")
         terminal.send("\x15$zzzz")
         terminal.until(lambda: "No skills found." in terminal.display, "empty result")
         terminal.send("\r")
         terminal.send(ESC)
-        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃ $zzzz"
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "$zzzz"
                        and "No skills found." not in terminal.display, "Esc preserves the draft")
         terminal.send("\x15")
         terminal.paste("HISTORY-SEED")
         terminal.submit("HISTORY-SEED")
         terminal.send("/cl\r")
         terminal.until(lambda: terminal.screen.display[0].rstrip() == terminal.header
-                       and terminal.screen.display[2].rstrip() == "┃"
+                       and terminal.screen.cursor.y == 3 and terminal.screen.display[3].rstrip() == ""
                        and "HISTORY-SEED" not in terminal.display, "fresh screen")
         require(terminal.transcript.count("HISTORY-SEED") == 2, "Clear destroyed native scrollback")
         require("/272k" not in terminal.display, "Clear did not reset mock context")
@@ -569,7 +583,7 @@ def menus(binary):
             terminal.send("\x03")
             terminal.until(lambda: "Cancelled ·" in terminal.output[start:], "Ctrl+C cancellation")
             require("again to exit" not in terminal.output[start:], "Active Ctrl+C offered to close the session")
-            require("┃ next draft" in terminal.display, "Ctrl+C lost the next draft")
+            require("next draft" in terminal.display, "Ctrl+C lost the next draft")
             terminal.send("\x15")
 
         terminal.paste("old pending")
@@ -582,7 +596,7 @@ def menus(binary):
         require("Thinking" in terminal.display, "Esc closed the request instead of the picker")
         terminal.send("\x15/cl\r")
         terminal.until(lambda: terminal.screen.display[0].rstrip() == terminal.header
-                       and terminal.screen.display[2].rstrip() == "┃"
+                       and terminal.screen.cursor.y == 3 and terminal.screen.display[3].rstrip() == ""
                        and "Thinking" not in terminal.display, "clear while active")
         terminal.paste("new conversation")
         terminal.submit("new conversation")
@@ -592,7 +606,7 @@ def menus(binary):
                        "Existing session asks for exit confirmation")
         terminal.send("/clear\r")
         terminal.until(lambda: terminal.screen.display[0].rstrip() == terminal.header
-                       and terminal.screen.display[2].rstrip() == "┃"
+                       and terminal.screen.cursor.y == 3 and terminal.screen.display[3].rstrip() == ""
                        and "/272k" not in terminal.display, "clear before exit")
         start = len(terminal.output)
         terminal.exit("\x03")
@@ -608,6 +622,7 @@ def markdown(binary):
     source = ("Streaming preview " + "draft remains editable. " * 20 + "PREVIEW-END\n\n"
               "# Heading\n\n**bold** and *italic*, ~~old~~ and `code`.\n\n"
               "- first\n  - nested\n- [x] done\n\n"
+              "1. step\n\n   > **quoted** step\n\n"
               "[site](https://example.org) [src/main.rs](/Users/user/Code/clankr/src/main.rs)\n\n"
               "```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n"
               "| name | value |\n| --- | ---: |\n| Makefile | 42 |\n| 界 | 1234 |\n\n"
@@ -619,28 +634,64 @@ def markdown(binary):
         terminal.send("\r")
         terminal.until(lambda: "Thinking" in terminal.display, "markdown request")
         terminal.paste("next draft")
-        terminal.until(lambda: any(row.startswith("Streaming preview")
-                                  for row in terminal.screen.display), "unfinished paragraph preview")
-        require(not any("PREVIEW-END" in row for row in terminal.screen.display
-                        if not row.startswith("┃")), "Paragraph appeared only after its end arrived")
-        require("┃ next draft" in terminal.display, "Preview hid the next draft")
+        def reply_rows():
+            rows = terminal.screen.display
+            end = next((i for i, row in enumerate(rows) if row.rstrip() == "Final paragraph."), -1)
+            return rows[end + 1:]
+
+        terminal.until(lambda: any(row.startswith("Streaming preview") for row in reply_rows()),
+                       "unfinished paragraph preview")
+        require(not any("PREVIEW-END" in row for row in reply_rows()),
+                "Paragraph appeared only after its end arrived")
+        require("next draft" in terminal.display, "Preview hid the next draft")
         terminal.until(lambda: "Generating" in terminal.display
                        and any(row.rstrip() == "Heading" for row in terminal.screen.display),
                        "heading during streaming")
         require(not SUMMARY.search(terminal.output[start:]), "Markdown appeared only after completion")
         terminal.until(lambda: SUMMARY.search(terminal.output[start:])
-                       and "┃ next draft" in terminal.display, "formatted response and next draft",
+                       and "next draft" in terminal.display, "formatted response and next draft",
                        timeout=15)
         rows = terminal.screen.display
+        buffer = terminal.screen.buffer
         heading = next(i for i, row in enumerate(rows) if row.rstrip() == "Heading")
-        require(terminal.screen.buffer[heading][0].bold, "Heading is not bold")
+        require(buffer[heading][0].bold and buffer[heading][0].fg == "blue",
+                "Heading is not bold blue")
         inline = next(i for i, row in enumerate(rows)
                       if row.rstrip() == "bold and italic, old and code.")
+        require(buffer[inline][rows[inline].index("code")].fg == "cyan", "Inline code is not cyan")
+        require(buffer[inline][0].fg == "default", "Inline code colour leaked")
+        # The submitted prompt repeats the source lines; the reply comes last.
+        fn = max(i for i, row in enumerate(rows) if row.rstrip() == "fn main() {")
+        require(buffer[fn][0].fg == "magenta" and buffer[fn][3].fg == "blue",
+                "Rust keyword or function name is not highlighted")
+        hello = max(i for i, row in enumerate(rows) if row.rstrip() == '    println!("hello");')
+        col = rows[hello].index('"hello"')
+        require(all(buffer[hello][i].fg == "green" for i in range(col, col + 7))
+                and buffer[hello][col + 7].fg == "default", "Rust string is not green")
+        # Fences sit on their own rows, so the rows between them are exactly the code.
+        fence = max(i for i, row in enumerate(rows) if row.rstrip() == "```rust")
+        require([row.rstrip() for row in rows[fence:fence + 5]]
+                == ["```rust", "fn main() {", '    println!("hello");', "}", "```"],
+                "Code block is not fenced Markdown")
+        # pyte drops SGR 2, so check the stream: code fences are faint decorations.
+        require(ESC + "[0m" + ESC + "[2m```rust" in terminal.output
+                and ESC + "[0m" + ESC + "[2m```" + ESC + "[0m" in terminal.output,
+                "Code fence is not faint")
+        require(not re.search(r"\x1b\[[0-9;]*[34]8;", terminal.output),
+                "Use classic palette colours, not 256/RGB colours or backgrounds")
+        summary = SUMMARY.search(terminal.output[start:])[1]
+        for row in (next(i for i, row in enumerate(rows) if row.rstrip() == "  " + summary),
+                    terminal.screen.cursor.y):
+            require(all(cell.fg == "default" and cell.bg == "default"
+                        for cell in buffer[row].values()), "Markdown colour leaked into the UI")
         for word, attr in (("bold", "bold"), ("italic", "italics"), ("old", "strikethrough")):
             col = re.search(rf"\b{word}\b", rows[inline]).start()
             require(getattr(terminal.screen.buffer[inline][col], attr), f"Missing {word} style")
-        for text in ("- first", "  - nested", "- [x] done", "site src/main.rs",
-                     "─ rust ─────", '    println!("hello");', "name     │ value",
+        # Blocks inside an item keep its indent; the nested quote marker stays faint.
+        require("   " + ESC + "[0m" + ESC + "[2m> " + ESC + "[0m" + ESC + "[1mquoted" in terminal.output,
+                "Quote in item is not indented")
+        for text in ("- first", "  - nested", "- [x] done", "   > quoted step", "site src/main.rs",
+                     '    println!("hello");', "name     │ value",
                      "─────────┼──────", "Makefile │    42", "界       │  1234"):
             require(text in terminal.transcript, f"Missing Markdown output: {text}")
         require(not terminal.screen.buffer[inline][rows[inline].index("code")].underscore,
@@ -658,14 +709,14 @@ def markdown(binary):
         require("(https://example.org)" not in terminal.display.split("site src/main.rs", 1)[1],
                 "Hyperlink destination duplicated after its label")
         draft = terminal.screen.cursor.y
-        require(not terminal.screen.buffer[draft][2].bold
-                and not terminal.screen.buffer[draft][2].underscore, "Markdown style leaked into input")
+        require(not terminal.screen.buffer[draft][0].bold
+                and not terminal.screen.buffer[draft][0].underscore, "Markdown style leaked into input")
         terminal.send("\x03")
         terminal.until(lambda: "press ctrl+c again to exit" in terminal.display, "exit hint")
         terminal.exit("\x03")
     finally:
         terminal.close()
-    print("PASS markdown: streamed heading, nested styles/lists, links, code indentation, table, draft, default colours and terminal cleanup")
+    print("PASS markdown: streamed heading, nested styles/lists, links, code indentation and highlighting, table, draft, palette colours without leaks and terminal cleanup")
 
 
 def models(binary):
@@ -675,13 +726,13 @@ def models(binary):
     def selected(value):
         terminal.until(lambda: "auto · " + value in terminal.display
                        and "esc close" not in terminal.display
-                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃",
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "",
                        "selected " + value)
 
     try:
         terminal.ready()
         terminal.send("/fast" + RIGHT)
-        terminal.until(lambda: "┃ /fast" in terminal.display and "⚡" in terminal.display
+        terminal.until(lambda: "/fast" in terminal.display and "⚡" in terminal.display
                        and "esc close" not in terminal.display, "Fast completion does not toggle")
         terminal.send("\r")
         selected("echo · medium")
@@ -698,7 +749,7 @@ def models(binary):
         for cols, rows in ((40, 12), (1, 1), (119, 53)):
             terminal.resize(cols, rows)
         terminal.send("gpt-6.1" + RIGHT)
-        terminal.until(lambda: "┃ /model gpt-6.1-sol" in terminal.display
+        terminal.until(lambda: "/model gpt-6.1-sol" in terminal.display
                        and "auto · echo · medium" in terminal.display, "model completion without applying")
         terminal.send("\r")
         selected("gpt-6.1-sol · medium · ⚡")
@@ -718,7 +769,7 @@ def models(binary):
         terminal.menu("Models 1")
         terminal.send(ESC)
         terminal.until(lambda: "auto · gpt-6.1-sol · low" in terminal.display
-                       and "┃ /model opus" in terminal.display, "Esc discards model selection")
+                       and "/model opus" in terminal.display, "Esc discards model selection")
         terminal.send("\x15/effort high\r")
         selected("gpt-6.1-sol · high")
         terminal.send("/model sonnet\r")
@@ -739,11 +790,11 @@ def models(binary):
                 "Missing explanation for a model without effort")
         terminal.send(lower + higher + "\r" + ESC)
         terminal.until(lambda: "auto · haiku" in terminal.display
-                       and "┃ /effort" in terminal.display, "Unsupported effort stays unset")
+                       and "/effort" in terminal.display, "Unsupported effort stays unset")
         terminal.send("\x15/model opus\r")
         selected("opus · xhigh")
         terminal.send(",.")
-        terminal.until(lambda: "┃ ,." in terminal.display, "Plain punctuation still edits the draft")
+        terminal.until(lambda: ",." in terminal.display, "Plain punctuation still edits the draft")
         terminal.send("\x15")
         terminal.paste("selected model echo")
         terminal.submit("selected model echo", model="opus")

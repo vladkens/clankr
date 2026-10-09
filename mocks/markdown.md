@@ -152,6 +152,13 @@ ORDER BY total DESC
 LIMIT 10;
 ```
 
+### Diff
+
+```diff
+-let charge = 0;
++let charge = 42;
+```
+
 ### Block without a language
 
 ```

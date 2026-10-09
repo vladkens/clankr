@@ -6,7 +6,7 @@ Current stage: TUI with mocks. A normal `clankr` launch opens the editor; a subm
 
 Foundation: `cbeef65 initialize project` contains an empty Rust executable, Cargo, Makefile, rustfmt, `readme.md`, and `agents.md`. The source for selective migration is the local `old` branch at `f503db8`. Extract only the parts needed, not entire interconnected monolithic modules. Parts of `old:readme.md` lag behind the code; check Cmd+Backspace behavior against the latest fix in `old:src/input.rs` and its regression tests.
 
-Completed: editor and echo (`ce8dcdc`), command/skill menus and model settings (`86b081e`), native response wrapping and Ctrl+C behavior (`5909c41`), and streaming Markdown. The next recommended task is fixing mouse copying of submitted user messages. Other task cards remain candidates and do not start automatically.
+Completed: editor and echo (`ce8dcdc`), command/skill menus and model settings (`86b081e`), native response wrapping and Ctrl+C behavior (`5909c41`), and streaming Markdown. Copying submitted user messages has been fixed; the next recommended task is copying code blocks. Other task cards remain candidates and do not start automatically.
 
 ## How to structure commits
 
@@ -47,26 +47,26 @@ Implementation result: `make check`, `make test` (21 tests), `make build`, and t
 
 - [x] `/` opens commands, and `$` opens a separate skill list. Filtering, cyclic navigation, Right/Tab completion, and Esc dismissal are available. `/clear`, `/quit`, `/copy`, `/fast`, `/model`, and `/effort` work in the normal TUI; `/help` is not needed. Skill and model lists are still mocks.
 - [x] Model selection preserves compatible effort or uses the model's default otherwise. Effort is selected separately through the menu or Ctrl+, / Ctrl+.; fast mode changes independently. The active request retains its settings while the next draft is edited.
-- [x] Markdown renders headings, nested formatting, lists, block quotes, aligned tables, and code blocks. Links are underlined and clickable, without repeating the URL next to the label; inline code is not underlined. `/copy` uses the original response.
+- [x] Markdown renders headings, nested formatting, lists, block quotes, aligned tables, and code blocks. Every line of a nested block repeats its container prefixes: a list item adds indentation matching its marker width, and a block quote adds a faint `> `; an empty line inside a quote remains `>`. Links are underlined and clickable, without repeating the URL next to the label; inline code is not underlined. `/copy` uses the original response.
 - [x] After waiting, echo emits up to 16 graphemes every 50 ms. An unfinished block appears in an editable preview; a completed block enters history with native wrapping. The draft remains available. Terminal colors are preserved; the startup line chooses one robot splash per launch.
-- [x] One manual example, `mocks/markdown.md`, and `mocks/robot.svg` replace the numbered examples. Code has no syntax highlighting yet, formulas remain text, and images are represented by alt text/links.
+- [x] One manual example, `mocks/markdown.md`, and `mocks/robot.svg` replace the numbered examples. Syntax highlighting is described in a separate task card below; formulas remain text, and images are represented by alt text/links.
 
 Current Markdown validation: `make check test build` (50 Rust tests), PTY `tui`, `menus`, `markdown`, and the complete manual fixture through the PTY passed. The Ghostty 1.3.1 engine was checked separately: character-by-character streaming, width changes, and selection preserve the response's original newlines without duplication. This does not verify physical keys or the GUI clipboard in all terminals.
 
-## Next task: clean copying of user messages
+## Completed: clean copying of user messages
 
-Commit: `preserve native wrapping in submitted user messages`. Paths: `src/view.rs`, `tests/cli.py`, focused renderer regression tests. The current `Live::prompt` wraps lines manually and prints `┃ ` before each one; selection includes both prefixes and extra newlines.
+Commit: `preserve native wrapping in submitted user messages`. Paths: `src/view.rs`, `tests/cli.py`, focused renderer regression tests. The previous `Live::prompt` wrapped lines manually and printed `┃ ` before each one; selection included both prefixes and extra newlines.
 
 Verified in the Ghostty 1.3.1 engine: ordinary borders, OSC 133 prompt markers, DECSCA, and left margins do not exclude `┃` from selection. Bold and inverse text without added characters copies continuously, including after resizing. The [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout) allows a separate image layer; using it for a border would require independent support and reflow checks and is not considered a ready solution.
 
-- [ ] Render submitted text with native wrapping, preserving only the user's original newlines and indentation. Remove repeated `┃ ` prefixes from history; do not parse user text as Markdown.
-- [ ] Proposed interface: short `:: you` and `:: clankr` labels on separate lines, with the message body starting in the first column; user text stays bold, and responses use Markdown. Labels sit outside paragraphs so the body can be selected without them. Keep default colors; the editor and its `┃` remain a separate mutable region. The user has not yet accepted the final design.
-- [ ] Check the user's long example, multiple paragraphs, original indentation, Unicode, blank lines, narrow windows, and resizing. Completed history is not redrawn, and mouse input is not captured.
-- [ ] Validation: `make check test build`, PTY `tui`, `markdown`; a focused test selecting a long user message before/after resizing, then mouse selection in Ghostty. Check that the summary, next draft, and cancellation stay in place. The fix and its tests belong in one commit.
+- [x] Submitted text uses native terminal wrapping, preserving only the user's original newlines and indentation; `┃ ` was removed from both history and the editor. User text is not parsed as Markdown.
+- [x] Accepted design: roles differ through attributes, not color. Submitted messages are bold (SGR 1), starting in the first column without role labels or borders; responses use normal text with Markdown. Service lines, including turn summaries (time, tokens, cancellation, errors) and notifications such as `Copied to clipboard.`, are faint (SGR 2) with a 2-column indent; they are not copied. Faint `─` lines frame the editor above and below, with the status directly beneath the lower line; that line also forms the menu's upper boundary. Colors are reserved for Markdown highlighting: headings will receive a color accent, so bold text in the default color remains the user-message marker. The terminal derives attributes from its current text color, so history follows theme changes, including in tmux. In small windows, lines disappear before the status and input.
+- [x] A focused test selects a long message with paragraphs, indentation, Unicode, and blank lines before/after resizing 80 → 40 → 120, then compares it with the source. Completed history is not redrawn, and mouse input is not captured.
+- [x] Validation: `make check test build` (53 tests), PTY `tui`, `menus`, `models`, `markdown`. Mouse selection in a real terminal remains a manual check.
 
 ## How to choose subsequent tasks
 
-After fixing copying, the proposed next step is code highlighting, followed by the next needed TUI capability or API integration. Formulas are deferred until a suitable renderer is available. Do not invent an intermediate feature just to create another commit.
+After fixing user-message copying, handle easy copying of code blocks as a separate task, then syntax highlighting. Next, choose the needed TUI capability or API integration. Formulas are deferred until a suitable renderer is available. Do not invent an intermediate feature just to create another commit.
 
 The candidates are listed below. Before implementing a selected task card, refine its scope against the working application. A dependency means required behavior, not a mandatory commit number. For current changes, run `make check`, focused tests, `make build`, and the feature scenario; the full `make test` is needed when shared contracts change.
 
@@ -74,13 +74,23 @@ Task scenarios are covered jointly by Rust tests and the PTY. After API integrat
 
 ## Candidates: TUI improvements
 
+### Copy code blocks without decorative borders
+
+Commit: `make rendered code blocks easy to copy`. Paths: `src/markdown.rs`, `src/view.rs`, `tests/cli.py`. This is separate from copying user messages and from syntax highlighting. Currently, `Render::open/close` adds actual `─ robotlang ─────` and `────────` lines to the response content; these are not a separate visual border and enter the clipboard when selected.
+
+- [x] The `─ rust ─────`/`────────` borders were replaced with faint (SGR 2) fence lines: the opening fence is three backticks plus the first token of the info string (`` ```rust ``, or `` ``` `` without a language), and the closing fence is `` ``` ``. Each fence occupies a separate line, so selecting the body copies only code, while copying the whole response retains valid Markdown. Indented blocks and `~~~` blocks use the same `` ``` `` fences; within lists and quotes, fences receive the normal container prefixes. Tables, quotes, and the `────────` separator are unchanged; `/copy` still copies the original response.
+- [x] The block body, highlighting, preview `seed` state, and streaming invariants are unchanged: indentation, blank lines, and Unicode copy as-is, without prefixes or width-induced newlines.
+- [x] Limitation: `mdtext 0.1.2` does not expose the original fence character and length, and the opening line is printed before the body, so fences always use three backticks. A nested block such as ```` ````markdown ```` from `mocks/markdown.md` renders correctly, but in copied text the inner `` ``` `` closes the outer block prematurely.
+- [x] Validation: `make check test build` (58 tests), PTY `tui`, `menus`, `models`, `markdown`. Tests cover fences with/without a language, `~~~`, indented blocks, blocks inside lists and quotes, nested ```` ````markdown ````, faint fence styling, and code highlighting; streaming (including indented blocks, `~~~`, and nested fences) matches full rendering; selecting code in the view before/after resizing matches the source between fences. PTY `markdown` checks the lines between fences and their faint styling. Manual selection in a real terminal was not performed.
+
 ### Markdown code highlighting
 
 Commit: `highlight streamed markdown code blocks`. Paths: `src/markdown.rs`, `src/view.rs`, Cargo files, `tests/cli.py`, `mocks/markdown.md`. Requires completed streaming Markdown; no API is needed.
 
-- [ ] Use an existing Rust highlighting library that preserves state between lines; add the current dependency through `cargo add`. Check Rust, Python, TypeScript, Bash, JSON, and SQL from the shared example; leave unknown/unspecified languages as plain text.
-- [ ] Preserve code text and indentation, native wrapping, and the original `/copy` output. Highlight incoming lines, including multiline comments and strings; preview must not change completed history. Restrict color styling to code, using the terminal palette without changing the overall background or other elements.
-- [ ] Check that final text and styling match for complete and chunked input, unclosed code fences, cancellation, resizing, and color resets before the next paragraph/editor. Update PTY ANSI checks only for allowed colors. Validation: `make check test build` and PTY `markdown`.
+- [x] Highlighting uses `syntect 5.3` (`default-features = false`, `parsing` + `regex-fancy`, without onig/C) and bat syntaxes from `two-face 0.5.2` (`syntect-fancy`): syntect's set lacks TypeScript, and the JavaScript grammar corrupts state on TS types. The syntax set loads lazily at the first block with a language. Rust, Python, TypeScript, Bash, JSON, SQL, and diff are highlighted; unknown/unspecified languages and indented blocks remain plain text.
+- [x] The palette uses only ANSI-16 through classic SGR 31–36, with no backgrounds, 256/RGB, black/white, or bright colors, so previously printed history also follows theme changes. Headings are bold blue (default-color bold remains reserved for user messages), inline code is cyan without underlining, and links are unchanged. Faint (SGR 2): code block borders, table borders, separators, and quote prefixes. In code: keywords/storage are magenta, strings green, numbers and constants yellow, functions blue, types cyan, comments faint italic, and diff `+`/`-` green/red; everything else uses the default color. A small syntect theme selects scopes, storing the SGR code in the red channel.
+- [x] Text, indentation, native wrapping, and `/copy` are unchanged; styling uses only SGR. Parser state lives in the committed renderer for each block and resets at every fence; mdtext emits code only as complete lines, appending `\n` to the last line on completion. Preview still redraws the open block from the start, but uses saved state for previously displayed lines, keeping styles consistent without quadratic highlighting. Each `Text::write` ends with a reset, preventing color from leaking into the next paragraph, editor, or summary.
+- [x] Validation: `make check test build` (56 tests), PTY `tui`, `menus`, `models`, `markdown`, and the complete `mocks/markdown.md` through the PTY passed. Tests cover heading/inline-code/decoration palettes, Rust/Python/TypeScript/diff colors, plain text for unknown languages, multiline comments/strings, streaming (splits within lines and tokens) matching full rendering, committed + preview = completed prefix, and the absence of `38;`/`48;` or color leaks into the UI. The release binary grew from 1.4 → 4.2 MiB (3.5 MiB after strip); bat syntax data is ≈0.9 MiB. The first TypeScript block compiles regular expressions in ≈0.3 s. Mouse selection in a real terminal remains a manual check.
 
 ### Readable Markdown formulas
 
@@ -282,4 +292,4 @@ As related features arrive, check them together: skill → resource read → app
 
 ## Plan status
 
-The working TUI, menus, native response wrapping, and streaming Markdown are implemented. Continue developing the interface with mocks. The next priority is clean copying of user messages; the fix is not implemented yet, and the proposed design is described above. Code highlighting follows it; APIs, real skills, session persistence, and tools remain separate candidates.
+The working TUI, menus, native response wrapping, and streaming Markdown are implemented. Continue developing the interface with mocks. Clean copying of user messages is implemented along with the new editor design. Next, fix code-block copying separately, then add syntax highlighting. APIs, real skills, session persistence, and tools remain separate candidates.

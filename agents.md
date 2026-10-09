@@ -1,5 +1,6 @@
 # clankr
 
+- Prefer minimal, readable code and a small, coherent design. Use existing library capabilities before writing custom machinery; add dependencies or abstractions only when they simplify the complete solution. Keep local fixes local instead of redesigning adjacent subsystems.
 - Develop each feature or fix on a dedicated branch. Every working commit must be a coherent, verified part of that change.
 - Fold corrections to unfinished work into the commit they repair using amend or fixup/rebase; do not leave separate cleanup commits for mistakes in that same work.
 - Squash the feature branch into one complete feature or fix commit when integrating into `main`. Include the supporting tests and documentation in that change.

@@ -61,13 +61,7 @@ impl Layout {
   pub fn new(text: &str, cols: u16, first: &str, rest: &str) -> Self {
     let width = usize::from(cols.saturating_sub(1).max(1));
     let prefix = |s: &str| {
-      if s.width() < width {
-        s.to_owned()
-      } else if s == "┃ " && width > 1 {
-        "┃".into()
-      } else {
-        String::new()
-      }
+      if s.width() < width { s.to_owned() } else { String::new() }
     };
     let row = |s: &str| Row { text: prefix(s), stops: Vec::new() };
     let mut line = row(first);
@@ -113,7 +107,7 @@ impl Layout {
   }
 
   pub fn input(text: &str, cols: u16) -> Self {
-    Self::new(text, cols, "┃ ", "┃ ")
+    Self::new(text, cols, "", "")
   }
 
   // A soft boundary has two caret positions with the same byte offset. Home/End and vertical
@@ -451,22 +445,22 @@ mod tests {
   fn visual_home_end_and_logical_home_end_are_distinct() {
     let mut dat = input("abcdefghi\nlast");
     dat.pos = 5;
-    edit(&mut dat, KeyCode::Home, 7);
+    edit(&mut dat, KeyCode::Home, 5);
     assert_eq!(dat.pos, 4);
-    assert_eq!(Layout::input(&dat.text, 7).cursor(dat.pos, dat.trailing), (1, 2));
-    edit(&mut dat, KeyCode::End, 7);
+    assert_eq!(Layout::input(&dat.text, 5).cursor(dat.pos, dat.trailing), (1, 0));
+    edit(&mut dat, KeyCode::End, 5);
     assert_eq!(dat.pos, 8);
-    assert_eq!(Layout::input(&dat.text, 7).cursor(dat.pos, dat.trailing), (1, 6));
-    dat.edit(KeyEvent::new(KeyCode::Char('a'), Mods::CONTROL), 7).unwrap();
+    assert_eq!(Layout::input(&dat.text, 5).cursor(dat.pos, dat.trailing), (1, 4));
+    dat.edit(KeyEvent::new(KeyCode::Char('a'), Mods::CONTROL), 5).unwrap();
     assert_eq!(dat.pos, 0);
-    dat.edit(KeyEvent::new(KeyCode::Char('e'), Mods::CONTROL), 7).unwrap();
+    dat.edit(KeyEvent::new(KeyCode::Char('e'), Mods::CONTROL), 5).unwrap();
     assert_eq!(dat.pos, 9);
     dat.pos = 1;
-    edit(&mut dat, KeyCode::Down, 7);
+    edit(&mut dat, KeyCode::Down, 5);
     assert_eq!(dat.pos, 5);
-    edit(&mut dat, KeyCode::Down, 7);
+    edit(&mut dat, KeyCode::Down, 5);
     assert_eq!(dat.pos, 9);
-    edit(&mut dat, KeyCode::Up, 7);
+    edit(&mut dat, KeyCode::Up, 5);
     assert_eq!(dat.pos, 5);
   }
 
@@ -476,7 +470,7 @@ mod tests {
     assert!(!dat.edit(key(KeyCode::Up), 80).unwrap());
     assert!(!dat.edit(key(KeyCode::Down), 80).unwrap());
     dat.insert("first\n\n").unwrap();
-    assert_eq!(Layout::input(&dat.text, 80).cursor(dat.pos, false), (2, 2));
+    assert_eq!(Layout::input(&dat.text, 80).cursor(dat.pos, false), (2, 0));
     assert!(!dat.edit(key(KeyCode::Down), 80).unwrap());
     edit(&mut dat, KeyCode::Up, 80);
     assert_eq!(dat.pos, 6);
@@ -561,15 +555,15 @@ mod tests {
   #[test]
   fn shared_layout_tracks_unicode_tab_and_soft_boundary_offsets() {
     let text = "界e\u{301}👩‍💻x\n\tend";
-    let layout = Layout::input(text, 8);
+    let layout = Layout::input(text, 6);
     assert_eq!(
       layout.rows.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(),
-      ["┃ 界e\u{301}👩‍💻", "┃ x", "┃     e", "┃ nd"]
+      ["界e\u{301}👩‍💻", "x", "    e", "nd"]
     );
     let boundary = "界e\u{301}👩‍💻".len();
-    assert_eq!(layout.cursor(boundary, false), (1, 2));
-    assert_eq!(layout.cursor(boundary, true), (0, 7));
-    assert_eq!(layout.cursor("界e\u{301}👩‍💻x\n\t".len(), false), (2, 6));
+    assert_eq!(layout.cursor(boundary, false), (1, 0));
+    assert_eq!(layout.cursor(boundary, true), (0, 5));
+    assert_eq!(layout.cursor("界e\u{301}👩‍💻x\n\t".len(), false), (2, 4));
   }
 
   #[test]
@@ -585,16 +579,13 @@ mod tests {
         assert!(layout.rows[row].stops.iter().any(|&(p, _)| p == pos));
       }
       assert!(layout.rows.iter().all(|row| row.text.width() <= usize::from(cols)));
-      if cols >= 3 {
-        assert!(layout.rows.iter().all(|row| row.text.starts_with('┃')));
-      }
       assert_eq!(dat.text, text);
       assert_eq!(dat.pos, text.len());
     }
     let mut dat = input("abcdefgh");
     dat.pos = 1;
     edit(&mut dat, KeyCode::Down, 7);
-    assert_eq!(dat.pos, 5);
+    assert_eq!(dat.pos, 7);
     edit(&mut dat, KeyCode::Home, 80);
     assert_eq!(dat.pos, 0);
   }

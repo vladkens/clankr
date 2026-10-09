@@ -1,41 +1,142 @@
 use std::io::Write;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossterm::queue;
 use crossterm::style::{Attribute, SetAttribute};
 use mdtext::{Alignment, Event, ListKind, Options, Parser, Tag};
 use osc8::Hyperlink;
+use syntect::highlighting::{
+  Color, FontStyle, HighlightState, Highlighter, RangedHighlightIterator, StyleModifier, Theme,
+  ThemeItem,
+};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 use crate::{Res, input};
 
+// Classic SGR foregrounds use the terminal's own palette, so printed history follows theme changes.
+// Black, white and bright colours are avoided: some themes render them like the background.
+const RED: u8 = 31;
+const GREEN: u8 = 32;
+const YELLOW: u8 = 33;
+const BLUE: u8 = 34;
+const MAGENTA: u8 = 35;
+const CYAN: u8 = 36;
+
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct Style(u8);
+pub struct Style {
+  flags: u8,
+  colour: Option<u8>,
+}
 
 impl Style {
   const BOLD: u8 = 1;
   const ITALIC: u8 = 2;
   const STRIKE: u8 = 4;
+  const FAINT: u8 = 8;
 
   fn with(self, flag: u8) -> Self {
-    Self(self.0 | flag)
+    Self { flags: self.flags | flag, ..self }
+  }
+
+  fn colour(self, colour: u8) -> Self {
+    Self { colour: Some(colour), ..self }
   }
 
   pub fn write(self, out: &mut impl Write) -> Res<()> {
     queue!(out, SetAttribute(Attribute::Reset))?;
     for (flag, attr) in [
       (Self::BOLD, Attribute::Bold),
+      (Self::FAINT, Attribute::Dim),
       (Self::ITALIC, Attribute::Italic),
       (Self::STRIKE, Attribute::CrossedOut),
     ] {
-      if self.0 & flag != 0 {
+      if self.flags & flag != 0 {
         queue!(out, SetAttribute(attr))?;
       }
     }
+    // crossterm would encode named colours as 38;5;n.
+    if let Some(colour) = self.colour {
+      write!(out, "\x1b[{colour}m")?;
+    }
     Ok(())
+  }
+}
+
+// Loaded on the first fenced block with a language; bat's set adds TypeScript, TOML and others.
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
+
+// A theme only selects scopes: red carries the SGR colour code, 0 keeps the default foreground.
+// Italic is reserved for comments, which render faint and italic.
+static THEME: LazyLock<Theme> = LazyLock::new(|| {
+  let item = |scope: &str, code: u8, font_style| ThemeItem {
+    scope: scope.parse().unwrap(),
+    style: StyleModifier {
+      foreground: Some(Color { r: code, g: 0, b: 0, a: 0 }),
+      background: None,
+      font_style,
+    },
+  };
+  let mut scopes = vec![item("comment", 0, Some(FontStyle::ITALIC))];
+  scopes.extend(
+    [
+      ("keyword, storage, keyword.operator.word", MAGENTA),
+      ("keyword.operator", 0),
+      ("string, markup.inserted", GREEN),
+      ("markup.deleted", RED),
+      ("constant.numeric, constant.language", YELLOW),
+      ("entity.name.function, support.function, support.macro, variable.function", BLUE),
+      (
+        "entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, \
+        entity.name.trait, entity.name.interface, entity.other.inherited-class, support.type, \
+        support.class",
+        CYAN,
+      ),
+    ]
+    .map(|(scope, code)| item(scope, code, None)),
+  );
+  Theme { scopes, ..Theme::default() }
+});
+
+static HIGHLIGHTER: LazyLock<Highlighter<'static>> = LazyLock::new(|| Highlighter::new(&THEME));
+
+// Parser state carries multi-line comments and strings from one code line to the next.
+#[derive(Clone)]
+struct Code {
+  parse: ParseState,
+  highlight: HighlightState,
+}
+
+impl Code {
+  fn new(lang: &str) -> Option<Self> {
+    let syntax = SYNTAXES.find_syntax_by_token(lang)?;
+    Some(Self {
+      parse: ParseState::new(syntax),
+      highlight: HighlightState::new(&HIGHLIGHTER, ScopeStack::new()),
+    })
+  }
+
+  fn line(&mut self, line: &str, base: Style) -> Option<Vec<(Style, Range<usize>)>> {
+    let ops = self.parse.parse_line(line, &SYNTAXES).ok()?;
+    let parts = RangedHighlightIterator::new(&mut self.highlight, &ops, line, &HIGHLIGHTER);
+    Some(
+      parts
+        .map(|(style, _, range)| {
+          let mut out = base;
+          if style.foreground.r != 0 {
+            out = out.colour(style.foreground.r);
+          }
+          if style.font_style.contains(FontStyle::ITALIC) {
+            out = out.with(Style::FAINT | Style::ITALIC);
+          }
+          (out, range)
+        })
+        .collect(),
+    )
   }
 }
 
@@ -149,7 +250,8 @@ enum Kind {
   Code,
   Quote,
   List(Option<u32>),
-  Item,
+  // Marker width and whether a blank line separates blocks inside the item.
+  Item(usize, bool),
   Table,
   Row,
   Cell,
@@ -177,11 +279,101 @@ struct Render {
   gap: usize,
   table: Option<Table>,
   marker: Option<usize>,
+  // Quotes and items whose prefixes the current line already has.
+  prefixed: usize,
+  code: Option<Code>,
+  // Preview only: committed highlighting state and the text offset where it applies.
+  seed: Option<(usize, Code)>,
 }
 
 impl Render {
   fn space(&mut self, n: usize) {
     self.gap = self.gap.max(n);
+  }
+
+  // Code fences, rules and quote markers are drawn faint so they recede behind the content.
+  fn decor(&mut self, text: &str) {
+    let style = std::mem::replace(&mut self.style, Style::default().with(Style::FAINT));
+    self.push(text);
+    self.style = style;
+  }
+
+  // mdtext emits fenced code one complete line at a time; only the final line may lack '\n'.
+  fn code(&mut self, text: &str) {
+    let mut text = input::clean(text, 0, true).0;
+    if text.is_empty() {
+      return;
+    }
+    if !text.ends_with('\n') {
+      text.push('\n');
+    }
+    let style = self.style;
+    for line in text.split_inclusive('\n') {
+      // The preview slices off committed lines, so it resumes their state instead of
+      // re-highlighting.
+      let len = self.text.text.len();
+      if let Some((start, code)) = self.seed.take_if(|(start, _)| len >= *start)
+        && start == len
+      {
+        self.code = Some(code);
+      }
+      if self.seed.is_some() {
+        self.push(line);
+        continue;
+      }
+      match self.code.as_mut().and_then(|code| code.line(line, style)) {
+        Some(parts) => {
+          for (part, range) in parts {
+            self.style = part;
+            self.push(&line[range]);
+          }
+          self.style = style;
+        }
+        // Unknown language, or a parser error that leaves the rest of the block plain.
+        None => {
+          self.code = None;
+          self.push(line);
+        }
+      }
+    }
+  }
+
+  // A block opens after a blank line, or on the marker line when it starts an item.
+  fn block(&mut self) {
+    if self.marker.is_none() {
+      self.space(2);
+    }
+  }
+
+  fn containers(&self) -> usize {
+    self.stack.iter().filter(|open| matches!(open.kind, Kind::Quote | Kind::Item(..))).count()
+  }
+
+  // Lines repeat their containers in nesting order: a faint marker for each quote and spaces
+  // under each item marker. A blank line keeps only the quote markers, without trailing spaces.
+  fn prefix(&mut self, range: Range<usize>, blank: bool) {
+    let mut parts: Vec<_> = self
+      .stack
+      .iter()
+      .filter_map(|open| match open.kind {
+        Kind::Quote => Some("> ".to_owned()),
+        Kind::Item(width, _) => Some(" ".repeat(width)),
+        _ => None,
+      })
+      .take(range.end)
+      .skip(range.start)
+      .collect();
+    if blank {
+      parts.truncate(parts.iter().rposition(|part| part.starts_with('>')).map_or(0, |i| i + 1));
+      if let Some(quote) = parts.last_mut() {
+        quote.truncate(1);
+      }
+    }
+    for part in parts {
+      let style =
+        if part.starts_with('>') { Style::default().with(Style::FAINT) } else { Style::default() };
+      self.text.push(&part, style, None);
+    }
   }
 
   fn push(&mut self, text: &str) {
@@ -196,14 +388,29 @@ impl Render {
     }
     if !self.text.text.is_empty() {
       let trailing = self.text.text.bytes().rev().take_while(|&c| c == b'\n').count();
-      self.text.push(&"\n".repeat(self.gap.saturating_sub(trailing)), Style::default(), None);
+      for line in trailing..self.gap {
+        if line > 0 {
+          // A blank line belongs to the containers of the line above and loosens their items.
+          self.prefix(0..self.prefixed, true);
+          for open in &mut self.stack {
+            if let Kind::Item(_, loose) = &mut open.kind {
+              *loose = true;
+            }
+          }
+        }
+        self.text.push("\n", Style::default(), None);
+      }
     }
     self.gap = 0;
     for part in text.split_inclusive('\n') {
+      let count = self.containers();
       if self.text.text.is_empty() || self.text.text.ends_with('\n') {
-        let quotes = self.stack.iter().filter(|open| matches!(open.kind, Kind::Quote)).count();
-        self.text.push(&"> ".repeat(quotes), Style::default(), None);
+        self.prefix(0..count, part == "\n");
+      } else {
+        // A block that starts an item still adds its own prefix after the marker.
+        self.prefix(self.prefixed..count, false);
       }
+      self.prefixed = count;
       self.text.push(part, self.style, self.link.as_ref());
     }
   }
@@ -219,18 +426,16 @@ impl Render {
         self.push(&text);
       }
       Event::Code(text) => {
-        self.push(&text);
-        if self.stack.last().is_some_and(|open| matches!(open.kind, Kind::Code))
-          && !text.is_empty()
-          && !text.ends_with('\n')
-        {
-          self.push("\n");
+        if self.stack.last().is_some_and(|open| matches!(open.kind, Kind::Code)) {
+          self.code(&text);
+        } else {
+          self.push(&text);
         }
       }
       Event::SoftBreak | Event::HardBreak => self.push("\n"),
       Event::ThematicBreak => {
         self.space(2);
-        self.push("────────");
+        self.decor("────────");
         self.space(2);
       }
       Event::TaskListMarker(checked) => self.push(if checked { "[x] " } else { "[ ] " }),
@@ -259,7 +464,7 @@ impl Render {
       for (i, cell) in row.iter().enumerate() {
         self.style = Style::default();
         if i > 0 {
-          self.push(" │ ");
+          self.decor(" │ ");
         }
         let pad = widths[i].saturating_sub(cell.text.width());
         let left = match table.align[i] {
@@ -281,7 +486,7 @@ impl Render {
       }
       if r == 0 {
         self.space(1);
-        self.push(&widths.iter().map(|&width| "─".repeat(width)).collect::<Vec<_>>().join("─┼─"));
+        self.decor(&widths.iter().map(|&width| "─".repeat(width)).collect::<Vec<_>>().join("─┼─"));
       }
     }
     self.style = style;
@@ -294,34 +499,38 @@ impl Render {
     let link = self.link.clone();
     let kind = match tag {
       Tag::Paragraph | Tag::HtmlBlock | Tag::DisplayMath | Tag::Heading(_) => {
-        if !self.stack.last().is_some_and(|open| matches!(open.kind, Kind::Item)) {
-          self.space(2);
+        if !self.stack.last().is_some_and(|open| matches!(open.kind, Kind::Item(..))) {
+          self.block();
         }
+        // A colour accent keeps headings apart from bold user messages.
         if matches!(tag, Tag::Heading(_)) {
-          self.style = style.with(Style::BOLD);
+          self.style = style.with(Style::BOLD).colour(BLUE);
         }
         Kind::Block
       }
       Tag::CodeBlock(info) => {
-        self.space(2);
+        self.block();
         let lang = info.as_deref().and_then(|info| info.split_whitespace().next()).unwrap_or("");
-        self.push(&if lang.is_empty() {
-          "────────".into()
-        } else {
-          format!("─ {lang} ─────")
-        });
-        self.push("\n");
+        // Fences on their own lines keep a selected body pure code and a copied reply valid
+        // Markdown. mdtext hides the source fence, so a body line of ``` ends the copy early.
+        self.decor(&format!("```{lang}\n"));
+        self.code = if lang.is_empty() { None } else { Code::new(lang) };
         Kind::Code
       }
       Tag::Quote => {
-        self.space(2);
+        self.block();
         Kind::Quote
       }
       Tag::List(kind) => {
-        if self.stack.iter().any(|open| matches!(open.kind, Kind::Item)) {
+        let loose = self.stack.iter().rev().find_map(|open| match open.kind {
+          Kind::Item(_, loose) => Some(loose),
+          _ => None,
+        });
+        // A nested list follows the previous block of a tight item directly.
+        if loose == Some(false) && self.marker.is_none() {
           self.gap = 1;
         } else {
-          self.space(2);
+          self.block();
         }
         Kind::List(match kind {
           ListKind::Ordered(n) => Some(n),
@@ -329,7 +538,6 @@ impl Render {
         })
       }
       Tag::Item => {
-        let depth = self.stack.iter().filter(|open| matches!(open.kind, Kind::List(_))).count();
         let list = self.stack.iter_mut().rev().find_map(|open| match &mut open.kind {
           Kind::List(n) => Some(n),
           _ => None,
@@ -343,9 +551,11 @@ impl Render {
           _ => "- ".into(),
         };
         let start = self.text.text.len();
-        self.push(&format!("{}{marker}", "  ".repeat(depth.saturating_sub(1))));
+        self.push(&marker);
         self.marker = Some(start);
-        Kind::Item
+        // The marker stands in for the item's own prefix on its first line.
+        self.prefixed += 1;
+        Kind::Item(marker.len(), false)
       }
       Tag::Link { url, .. } | Tag::Image { url, .. } => {
         if self.link.is_none() {
@@ -353,7 +563,10 @@ impl Render {
         }
         Kind::Inline
       }
-      Tag::CodeSpan => Kind::Inline,
+      Tag::CodeSpan => {
+        self.style = style.colour(CYAN);
+        Kind::Inline
+      }
       Tag::Strong | Tag::Emphasis | Tag::Strikethrough => {
         self.style = style.with(match tag {
           Tag::Strong => Style::BOLD,
@@ -363,7 +576,7 @@ impl Render {
         Kind::Inline
       }
       Tag::Table(align) => {
-        self.space(2);
+        self.block();
         self.table = Some(Table { align, rows: Vec::new(), cell: Text::default() });
         Kind::Table
       }
@@ -385,16 +598,20 @@ impl Render {
     let Some(open) = self.stack.pop() else { return };
     self.style = open.style;
     self.link = open.link;
+    self.prefixed = self.prefixed.min(self.containers());
     match open.kind {
       Kind::Block | Kind::Quote | Kind::List(_) => self.space(2),
-      // Items are adjacent even when the parser emits paragraph boundaries inside them.
-      Kind::Item => {
+      // Tight items are adjacent even though the parser emits paragraph boundaries inside them.
+      Kind::Item(_, loose) => {
         self.marker = None;
-        self.gap = 1;
+        if !loose {
+          self.gap = 1;
+        }
       }
       Kind::Code => {
+        self.code = None;
         self.space(1);
-        self.push("────────");
+        self.decor("```");
         self.space(2);
       }
       Kind::Table => {
@@ -489,12 +706,15 @@ impl Markdown {
       text.push(&input::clean(&pending[start..], 0, true).0, Style::default(), None);
       return text;
     }
-    let mut render = Render::default();
+    let shown =
+      self.render.text.text[self.preview_shown..self.committed_len()].trim_start_matches('\n');
+    let mut render = Render {
+      seed: self.render.code.clone().map(|code| (shown.len(), code)),
+      ..Render::default()
+    };
     for event in Parser::parse_str(pending, Options::GFM | Options::IMMEDIATE_MODE) {
       render.event(event);
     }
-    let shown =
-      self.render.text.text[self.preview_shown..self.committed_len()].trim_start_matches('\n');
     if render.text.text.starts_with(shown) {
       render.text.slice(shown.len()..render.text.text.len())
     } else {
@@ -520,8 +740,65 @@ mod tests {
       .collect()
   }
 
+  fn ansi(text: &Text) -> String {
+    let mut out = Vec::new();
+    text.write(&mut out, 0..text.text.len()).unwrap();
+    String::from_utf8(out).unwrap()
+  }
+
+  fn styled<'a>(text: &'a Text, word: &str) -> Vec<(&'a str, Style)> {
+    text
+      .parts()
+      .filter(|(part, ..)| part.contains(word))
+      .map(|(part, style, _)| (part, style))
+      .collect()
+  }
+
+  // The nested blocks section of mocks/markdown.md.
+  const NESTED: &str = "1. Первый пункт с несколькими абзацами.\n\n   \
+    Второй абзац всё ещё относится к первому пункту.\n\n   \
+    - Вложенный пункт.\n     - Ещё один уровень с **выделением**.\n     \
+    - Соседний пункт того же уровня.\n\n   \
+    > Цитата внутри первого пункта.\n   >\n   > Второй абзац цитаты с [ссылкой](src/main.rs).\n\n   \
+    ```rust\n   let robot = \"clankr\";\n   println!(\"roger roger, {robot}\");\n   ```\n\n\
+    2. Второй пункт снова на верхнем уровне.\n3. Третий пункт после вложенных блоков.\n\n\
+    > Внешняя цитата.\n>\n> > Вложенная цитата с *курсивом*.\n>\n> Возвращение во внешнюю цитату.";
+
+  const WIDE: &str = "9. nine\n10. ten\n    - nested\n\n    | A | B |\n    | - | - |\n    \
+    | 1 | 2 |\n11. eleven\n\n- > quote\n  >\n  > > inner";
+
   #[test]
-  fn markdown_formats_blocks_and_nested_styles_without_colours() {
+  fn nested_blocks_repeat_container_prefixes_on_every_line() {
+    let text = render(NESTED);
+    assert_eq!(
+      text.text,
+      "1. Первый пункт с несколькими абзацами.\n\n   \
+      Второй абзац всё ещё относится к первому пункту.\n\n   \
+      - Вложенный пункт.\n     - Ещё один уровень с выделением.\n     \
+      - Соседний пункт того же уровня.\n\n   \
+      > Цитата внутри первого пункта.\n   >\n   > Второй абзац цитаты с ссылкой.\n\n   \
+      ```rust\n   let robot = \"clankr\";\n   println!(\"roger roger, {robot}\");\n   \
+      ```\n\n\
+      2. Второй пункт снова на верхнем уровне.\n3. Третий пункт после вложенных блоков.\n\n\
+      > Внешняя цитата.\n>\n> > Вложенная цитата с курсивом.\n>\n> Возвращение во внешнюю цитату."
+    );
+    // Indents keep the default style, quote markers stay faint and code keeps its colours.
+    let out = ansi(&text);
+    assert!(out.contains("\r\n   \x1b[0m\x1b[2m> \x1b[0mЦитата"));
+    assert!(out.contains("\x1b[2m>\x1b[0m\r\n   \x1b[0m\x1b[2m> \x1b[0mВторой абзац цитаты"));
+    assert!(out.contains("```rust\r\n\x1b[0m   \x1b[0m\x1b[35mlet"));
+    assert_eq!(styled(&text, "let"), [("let", Style::default().colour(MAGENTA))]);
+    assert_eq!(styled(&text, "> >"), [("> > ", Style::default().with(Style::FAINT))]);
+
+    assert_eq!(
+      render(WIDE).text,
+      "9. nine\n10. ten\n    - nested\n\n    A │ B\n    ──┼──\n    1 │ 2\n\n11. eleven\n\n\
+      - > quote\n  >\n  > > inner"
+    );
+  }
+
+  #[test]
+  fn markdown_formats_blocks_and_nested_styles_with_palette_colours() {
     let source = "# Title\n\n**bold *both***, ~~old~~ and `code`.\n\n\
       - first\n  - nested\n- [x] done\n\n3. third\n4. fourth\n\n\
       > quoted\n> continuation\n\n[site](https://example.org)\n\n\
@@ -532,16 +809,130 @@ mod tests {
       "Title\n\nbold both, old and code.\n\n\
       - first\n  - nested\n- [x] done\n\n3. third\n4. fourth\n\n\
       > quoted\n> continuation\n\nsite\n\n\
-      ─ rust ─────\nfn main() {\n    println!(\"hello\");\n}\n────────"
+      ```rust\nfn main() {\n    println!(\"hello\");\n}\n```"
     );
-    let mut out = Vec::new();
-    text.write(&mut out, 0..text.text.len()).unwrap();
-    let out = String::from_utf8(out).unwrap();
-    assert!(out.contains("\x1b[1mTitle"));
+    let out = ansi(&text);
+    assert!(out.contains("\x1b[0m\x1b[1m\x1b[34mTitle\x1b[0m"));
     assert!(out.contains("\x1b[1m\x1b[3mboth"));
     assert!(out.contains("\x1b[9mold"));
-    assert!(out.contains("\x1b[0m and code."));
-    assert!(out.ends_with("\x1b[0m"));
+    assert!(out.contains("\x1b[0m and \x1b[0m\x1b[36mcode\x1b[0m."));
+    assert!(out.contains("\x1b[0m\x1b[2m> \x1b[0mquoted"));
+    assert!(out.contains("\x1b[0m\x1b[2m```rust\r\n\x1b[0m\x1b[35mfn"));
+    assert!(out.ends_with("\x1b[0m\x1b[2m```\x1b[0m"));
+    // Only classic palette colours: no 256-colour, truecolour or background sequences.
+    assert!(!out.contains("38;") && !out.contains("48;"));
+  }
+
+  #[test]
+  fn headings_inline_code_and_decorations_use_accents_and_faint_rules() {
+    let bold = Style::default().with(Style::BOLD);
+    let faint = Style::default().with(Style::FAINT);
+    let text = render(
+      "## Head `code`\n\nplain `span` [`link`](https://example.org)\n\n\
+      | A | B |\n| - | - |\n| 1 | 2 |\n\n---\n\n> quote",
+    );
+    assert_eq!(styled(&text, "Head"), [("Head ", bold.colour(BLUE))]);
+    assert_eq!(styled(&text, "code"), [("code", bold.colour(BLUE).colour(CYAN))]);
+    assert_eq!(styled(&text, "span"), [("span", Style::default().colour(CYAN))]);
+    let link = text.parts().find(|(part, ..)| *part == "link").unwrap();
+    assert_eq!((link.1, link.2.is_some()), (Style::default().colour(CYAN), true));
+    assert_eq!(styled(&text, "│"), [(" │ ", faint), (" │ ", faint)]);
+    assert_eq!(styled(&text, "┼"), [("──┼──", faint)]);
+    assert_eq!(styled(&text, "────────"), [("────────", faint)]);
+    assert_eq!(styled(&text, ">"), [("> ", faint)]);
+    assert_eq!(styled(&text, "quote"), [("quote", Style::default())]);
+    assert_eq!(ansi(&text).matches("\x1b[4m").count(), 1, "only the link is underlined");
+  }
+
+  #[test]
+  fn fenced_code_highlights_known_languages_and_leaves_others_plain() {
+    let comment = Style::default().with(Style::FAINT | Style::ITALIC);
+    let colour = |code| Style::default().colour(code);
+    let text = render(
+      "```rust\nfn main() {\n  // note\n  let s = \"hi\"; let n = 42; let b = true;\n}\n```",
+    );
+    assert_eq!(styled(&text, "fn"), [("fn", colour(MAGENTA))]);
+    assert_eq!(styled(&text, "main"), [("main", colour(BLUE))]);
+    assert_eq!(styled(&text, "// note"), [("// note\n", comment)]);
+    assert_eq!(styled(&text, "hi"), [("\"hi\"", colour(GREEN))]);
+    assert_eq!(styled(&text, "42"), [("42", colour(YELLOW))]);
+    assert_eq!(styled(&text, "true"), [("true", colour(YELLOW))]);
+    // Operators, punctuation and variables keep the default foreground.
+    assert!(styled(&text, "=").iter().all(|(_, style)| *style == Style::default()));
+    assert!(styled(&text, "{").iter().all(|(_, style)| *style == Style::default()));
+
+    let text = render(
+      "```python\ndef greet(robot: Robot) -> str:\n    # note\n    return f\"hi {robot}\" or 42 or None\n```",
+    );
+    assert_eq!(styled(&text, "def"), [("def", colour(MAGENTA))]);
+    assert_eq!(styled(&text, "greet"), [("greet", colour(BLUE))]);
+    assert_eq!(styled(&text, "str"), [("str", colour(CYAN))]);
+    assert_eq!(styled(&text, "# note"), [("# note\n", comment)]);
+    assert_eq!(styled(&text, "return"), [("return", colour(MAGENTA))]);
+    assert_eq!(styled(&text, "42"), [("42", colour(YELLOW))]);
+    assert_eq!(styled(&text, "None"), [("None", colour(YELLOW))]);
+
+    for lang in ["typescript", "ts", "bash", "json", "sql", "diff"] {
+      let text = render(&format!("```{lang}\nx\n```"));
+      assert!(Code::new(lang).is_some(), "{lang}");
+      assert_eq!(text.text, format!("```{lang}\nx\n```"));
+    }
+    let text = render("```ts\nconst x: number = 42;\n```");
+    assert_eq!(styled(&text, "const"), [("const", colour(MAGENTA))]);
+    assert_eq!(styled(&text, "number"), [("number", colour(CYAN))]);
+    let text = render("```diff\n-old\n+new\n```");
+    assert_eq!(styled(&text, "old"), [("-old\n", colour(RED))]);
+    assert_eq!(styled(&text, "new"), [("+new\n", colour(GREEN))]);
+
+    for source in ["```robotlang\nfn \"x\" 42\n```", "```\nfn \"x\" 42\n```", "    fn \"x\" 42"] {
+      let text = render(source);
+      assert_eq!(styled(&text, "fn"), [("fn \"x\" 42\n", Style::default())], "{source:?}");
+    }
+  }
+
+  // Shaped like the nested fence section of mocks/markdown.md.
+  const FENCED: &str = "````markdown\n# Head\n\n```rust\nprintln!(\"x\");\n```\n````\n\nafter";
+
+  #[test]
+  fn code_blocks_render_faint_markdown_fences_around_highlighted_code() {
+    let faint = Style::default().with(Style::FAINT);
+    let magenta = Style::default().colour(MAGENTA);
+    let plain = Style::default();
+    for (source, expected) in [
+      ("```rust\nlet x = 1;\n```", "```rust\nlet x = 1;\n```"),
+      ("~~~rust title\nlet x = 1;\n~~~", "```rust\nlet x = 1;\n```"),
+      ("```\nlet x = 1;\n```", "```\nlet x = 1;\n```"),
+      ("    let x = 1;", "```\nlet x = 1;\n```"),
+      ("- item\n\n  ```rust\n  let x = 1;\n  ```", "- item\n\n  ```rust\n  let x = 1;\n  ```"),
+      ("> ```rust\n> let x = 1;\n> ```", "> ```rust\n> let x = 1;\n> ```"),
+    ] {
+      let text = render(source);
+      assert_eq!(text.text, expected, "{source:?}");
+      let fences = styled(&text, "`");
+      assert_eq!(fences.len(), 2, "{source:?}");
+      assert!(fences.iter().all(|(_, style)| *style == faint), "{source:?}");
+      let code = if source.contains("rust") { ("let", magenta) } else { ("let x = 1;\n", plain) };
+      assert_eq!(styled(&text, "let"), [code], "{source:?}");
+    }
+    // mdtext does not expose the source fence, so a nested fence reuses three backticks.
+    let text = render(FENCED);
+    assert_eq!(text.text, "```markdown\n# Head\n\n```rust\nprintln!(\"x\");\n```\n```\n\nafter");
+    assert_eq!(parts(&text)[0], ("```markdown\n", faint, None));
+    assert!(styled(&text, "after").iter().all(|(_, style)| *style == plain));
+  }
+
+  #[test]
+  fn multiline_comments_and_strings_keep_their_style_on_following_lines() {
+    let comment = Style::default().with(Style::FAINT | Style::ITALIC);
+    let green = Style::default().colour(GREEN);
+    let text = render("```rust\n/* one\ntwo */ let s = \"a\nb\";\n```\n\nafter");
+    assert_eq!(styled(&text, "one"), [("/* one\ntwo */", comment)]);
+    assert_eq!(styled(&text, "let"), [("let", Style::default().colour(MAGENTA))]);
+    assert_eq!(styled(&text, "a\nb"), [("\"a\nb\"", green)]);
+    assert_eq!(styled(&text, "after"), [("\n\nafter", Style::default())]);
+    let text = render("```python\nx = \"\"\"doc\nstring\"\"\"\ny = 1\n```");
+    assert_eq!(styled(&text, "doc"), [("\"\"\"doc\nstring\"\"\"", green)]);
+    assert_eq!(styled(&text, "1"), [("1", Style::default().colour(YELLOW))]);
   }
 
   #[test]
@@ -552,17 +943,28 @@ mod tests {
       "- first\n  - nested\n- [ ] todo\n\n> quote\n> **strong**\n\nlast",
       "| name | value |\n| --- | ---: |\n| **bold** | 42 |\n\nlast",
       "```rust\nfn main() {}\n    e\u{301} 👩‍💻 界\n```\n\nnext",
+      "```rust\n/* multi\n   line */ let s = \"str\ning\"; // tail\n```\n\n**after**",
+      "> ```python\n> \"\"\"doc\n> string\"\"\"\n> ```\n\n1. ```ts\n   const x: number = 42;\n   ```",
       "```\n    unfinished code",
+      "```rust\nlet unfinished = \"str",
       "**unfinished `inline",
       "a\r\nb\r\n\r\nc\n\n&#27;[31m escaped \x1b[2J control",
+      "    indented\n\n~~~\ntilde\n~~~",
+      NESTED,
+      WIDE,
+      FENCED,
     ] {
       let expected = render(source);
       let mut markdown = Markdown::default();
-      let mut previous = String::new();
+      let mut previous = Vec::new();
+      // Every prefix splits a line or a token somewhere; committed spans and styles never change.
       for (i, c) in source.char_indices() {
         let text = markdown.update(&source[..i + c.len_utf8()], false);
-        assert!(text.text.starts_with(&previous), "changed emitted text for {source:?}");
-        previous.clone_from(&text.text);
+        let len = previous.iter().map(|(part, _): &(String, Style)| part.len()).sum::<usize>();
+        let committed: Vec<_> =
+          text.slice(0..len).parts().map(|(part, style, _)| (part.to_owned(), style)).collect();
+        assert_eq!(committed, previous, "changed emitted text for {source:?}");
+        previous = text.parts().map(|(part, style, _)| (part.to_owned(), style)).collect();
       }
       assert_eq!(parts(markdown.update(source, true)), parts(&expected), "{source:?}");
       assert!(!expected.text.contains('\x1b'));
@@ -585,7 +987,7 @@ mod tests {
     assert!(markdown.preview().text.is_empty());
 
     for (source, committed, pending) in [
-      ("```rust\nfn", "─ rust ─────\n", "fn\n────────"),
+      ("```rust\nfn", "```rust\n", "fn\n```"),
       ("- first\n- sec", "", "- first\n- sec"),
       ("| A | B |\n| - | - |\n| one | tw", "", "A   │ B\n────┼───\none │ tw"),
     ] {
@@ -596,6 +998,44 @@ mod tests {
       assert_eq!(&markdown.text().text[..markdown.committed_len()], committed, "{source:?}");
       assert_eq!(markdown.preview().text, pending, "{source:?}");
     }
+
+    // The preview re-renders the open block from its fence with the same highlighting state.
+    let mut markdown = Markdown::default();
+    let source = "```rust\n/* open\nstill */ fn";
+    for (i, c) in source.char_indices() {
+      markdown.update(&source[..i + c.len_utf8()], false);
+    }
+    let comment = Style::default().with(Style::FAINT | Style::ITALIC);
+    assert_eq!(styled(markdown.text(), "open"), [("/* open\n", comment)]);
+    assert_eq!(styled(markdown.preview(), "still"), [("still */", comment)]);
+    assert_eq!(styled(markdown.preview(), "fn"), [("fn", Style::default().colour(MAGENTA))]);
+    assert!(ansi(markdown.preview()).ends_with("\x1b[0m\x1b[2m```\x1b[0m"));
+
+    // Committed text plus preview renders like the finished prefix, whether the preview resumes
+    // the committed state mid-block or one update spans several blocks.
+    let source =
+      "```rust\n/* a\n b */ let s = \"x\ny\"; // z\nfn f() {}\n```\n\n```py\nx = 1\ny = \"\"\"q\nw";
+    let joined = |markdown: &Markdown| {
+      let mut text = markdown.text().slice(0..markdown.committed_len());
+      // The view separates a closed block from the next block's preview with a blank line.
+      if !text.text.is_empty() && !text.text.ends_with('\n') && !markdown.preview().text.is_empty()
+      {
+        text.push("\n\n", Style::default(), None);
+      }
+      for (part, style, link) in markdown.preview().parts() {
+        text.push(part, style, link);
+      }
+      text
+    };
+    let mut markdown = Markdown::default();
+    for (i, c) in source.char_indices() {
+      let prefix = &source[..i + c.len_utf8()];
+      markdown.update(prefix, false);
+      assert_eq!(parts(&joined(&markdown)), parts(&render(prefix)), "{prefix:?}");
+    }
+    let mut markdown = Markdown::default();
+    markdown.update(source, false);
+    assert_eq!(parts(&joined(&markdown)), parts(&render(source)));
 
     let source = "界".repeat(20000);
     let mut markdown = Markdown::default();
@@ -613,7 +1053,7 @@ mod tests {
     assert!(markdown.update(&second, false).text.contains("fn main() {}\n"));
     let third = format!("{second}    // still streaming\n");
     assert!(markdown.update(&third, false).text.ends_with("    // still streaming\n"));
-    assert!(markdown.update(&third, true).text.ends_with("\n────────"));
+    assert!(markdown.update(&third, true).text.ends_with("\n```"));
   }
 
   #[test]

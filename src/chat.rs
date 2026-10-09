@@ -201,8 +201,8 @@ impl App {
     }
   }
 
-  fn start(&mut self, prompt: Prompt, live: &mut Live, out: &mut impl Write, cols: u16) -> Res<()> {
-    live.prompt(out, &prompt.text, cols)?;
+  fn start(&mut self, prompt: Prompt, live: &mut Live, out: &mut impl Write) -> Res<()> {
+    live.prompt(out, &prompt.text)?;
     self.request = Some(Request::default());
     self.has_session = true;
     self.backend.start(prompt);
@@ -517,7 +517,7 @@ pub fn run() -> Res<()> {
       }
       match app.event(event, size.0) {
         Ok(Action::Exit) => return Ok(()),
-        Ok(Action::Send(text)) => app.start(text, &mut live, &mut out, size.0)?,
+        Ok(Action::Send(text)) => app.start(text, &mut live, &mut out)?,
         Ok(Action::Cancel) => app.cancel(),
         Ok(Action::Clear) => app.clear(&mut live, &mut out, size.1)?,
         Ok(Action::Copy) => app.copy(|text| {
@@ -565,7 +565,7 @@ mod tests {
   fn fast_toggles_the_status_and_next_request_without_changing_an_active_request() {
     let peer = Rc::new(RefCell::new(Peer::default()));
     let mut app = App::new(Box::new(Script(peer.clone())));
-    app.start("active".into(), &mut Live::default(), &mut Vec::new(), 80).unwrap();
+    app.start("active".into(), &mut Live::default(), &mut Vec::new()).unwrap();
     for fast in [false, true] {
       type_text(&mut app, "/fast");
       app.event(key(KeyCode::Right, Mods::NONE), 80).unwrap();
@@ -597,7 +597,7 @@ mod tests {
     app.poll(&mut live, &mut out, 80).unwrap();
     assert!(app.messages.is_empty());
 
-    app.start("question".into(), &mut live, &mut out, 80).unwrap();
+    app.start("question".into(), &mut live, &mut out).unwrap();
     let answer = "# Ответ\n\n```rust\nlet x = 1;\n```\n界 👩‍💻";
     peer.borrow_mut().events.extend([
       agent::Event::Text(answer.into()),
@@ -619,7 +619,7 @@ mod tests {
     assert!(app.messages.is_empty());
     assert!(app.input.text.is_empty());
 
-    app.start("next question".into(), &mut live, &mut out, 80).unwrap();
+    app.start("next question".into(), &mut live, &mut out).unwrap();
     app.copy(|text| {
       assert_eq!(text, answer);
       Ok(())
@@ -742,7 +742,7 @@ mod tests {
     let Action::Send(prompt) = app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap() else {
       panic!()
     };
-    app.start(prompt, &mut live, &mut out, 80).unwrap();
+    app.start(prompt, &mut live, &mut out).unwrap();
     type_text(&mut app, "next $age");
     app.event(key(KeyCode::Down, Mods::NONE), 80).unwrap();
     app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap();
@@ -779,7 +779,7 @@ mod tests {
     assert_eq!(prompt.settings.model.name, "opus");
     assert_eq!(prompt.settings.effort, Some(Effort::High));
     assert_eq!(prompt.skills, ["agent-rules"]);
-    app.start(prompt, &mut live, &mut out, 80).unwrap();
+    app.start(prompt, &mut live, &mut out).unwrap();
     let settings = app.settings;
     app.clear(&mut live, &mut out, 24).unwrap();
     assert_eq!(app.settings, settings);
@@ -810,7 +810,7 @@ mod tests {
     assert_eq!(prompt.skills, ["agent-rules"]);
     let peer = Rc::new(RefCell::new(Peer::default()));
     app.backend = Box::new(Script(peer.clone()));
-    app.start(prompt, &mut Live::default(), &mut Vec::new(), 80).unwrap();
+    app.start(prompt, &mut Live::default(), &mut Vec::new()).unwrap();
     app.event(Event::Paste("copy paste $agent-rules? 1221e".into()), 80).unwrap();
     assert!(app.menu.is_none() && app.input.skills.is_empty());
     assert_eq!(peer.borrow().prompts[0].skills, ["agent-rules"]);
@@ -849,7 +849,7 @@ mod tests {
     let mut app = App::default();
     let mut live = Live::default();
     let mut out = Vec::new();
-    app.start("active".into(), &mut live, &mut out, 80).unwrap();
+    app.start("active".into(), &mut live, &mut out).unwrap();
     type_text(&mut app, "$age");
     assert_eq!(app.event(key(KeyCode::Esc, Mods::NONE), 80).unwrap(), Action::None);
     assert!(app.menu.is_none());
@@ -918,7 +918,7 @@ mod tests {
     let mut app = App::new(Box::new(Script(peer.clone())));
     let mut live = Live::default();
     let mut out = Vec::new();
-    app.start("old turn".into(), &mut live, &mut out, 80).unwrap();
+    app.start("old turn".into(), &mut live, &mut out).unwrap();
     peer
       .borrow_mut()
       .events
@@ -974,7 +974,7 @@ mod tests {
     let Action::Send(text) = app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap() else {
       panic!()
     };
-    app.start(text, &mut live, &mut out, 80).unwrap();
+    app.start(text, &mut live, &mut out).unwrap();
     assert_eq!(app.frame().activity.as_deref(), Some("• Thinking (0s)"));
     live.draw(&mut out, &app.frame(), 80, 24).unwrap();
     app.event(Event::Paste("next 界\ndraft".into()), 80).unwrap();
@@ -1019,7 +1019,7 @@ mod tests {
     let mut app = App::new(Box::new(Script(peer.clone())));
     let mut live = Live::default();
     let mut out = Vec::new();
-    app.start("question".into(), &mut live, &mut out, 80).unwrap();
+    app.start("question".into(), &mut live, &mut out).unwrap();
     peer.borrow_mut().events.push_back(agent::Event::Text("kept".into()));
     app.poll(&mut live, &mut out, 80).unwrap();
     live.draw(&mut out, &app.frame(), 80, 24).unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
     assert!(app.request.is_none());
     assert_eq!(app.input.text, "next");
     let mut out = Vec::new();
-    app.start("another".into(), &mut live, &mut out, 80).unwrap();
+    app.start("another".into(), &mut live, &mut out).unwrap();
     app.stop(&mut live, &mut out, 80).unwrap();
     assert!(app.request.is_none());
     assert_eq!(peer.borrow().cancels, 2);
@@ -1054,7 +1054,7 @@ mod tests {
     let mut app = App::new(Box::new(Script(peer.clone())));
     let mut live = Live::default();
     let mut out = Vec::new();
-    app.start("question".into(), &mut live, &mut out, 80).unwrap();
+    app.start("question".into(), &mut live, &mut out).unwrap();
     peer.borrow_mut().events.extend((0..1000).map(|_| agent::Event::Text("x".into())));
     app.poll(&mut live, &mut out, 80).unwrap();
     assert!(!peer.borrow().events.is_empty());
@@ -1091,7 +1091,7 @@ mod tests {
     let mut app = App::new(Box::new(Script(peer.clone())));
     let mut live = Live::default();
     let mut out = Vec::new();
-    app.start("previous turn".into(), &mut live, &mut out, 80).unwrap();
+    app.start("previous turn".into(), &mut live, &mut out).unwrap();
     peer.borrow_mut().events.push_back(agent::Event::Finished(Ok(())));
     app.poll(&mut live, &mut out, 80).unwrap();
     app.input.insert("keep").unwrap();
