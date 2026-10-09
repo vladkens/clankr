@@ -504,7 +504,7 @@ impl Live {
     if cols == 0 || rows == 0 {
       return Err(invalid("Terminal dimensions must be nonzero").into());
     }
-    self.markdown.update(frame.response, false);
+    self.markdown.update(frame.response, false, cols);
     let resizing =
       !self.lines.is_empty() && (self.invalidated || cols != self.cols || rows != self.rows);
     let mut bytes = Vec::new();
@@ -577,7 +577,7 @@ impl Live {
     summary: Option<&str>,
     cols: u16,
   ) -> Res<()> {
-    self.markdown.update(response, true);
+    self.markdown.update(response, true, cols);
     let resizing = !self.lines.is_empty() && (self.invalidated || cols != self.cols);
     let mut bytes = Vec::new();
     self.cols = cols;

@@ -7,6 +7,7 @@ use crossterm::queue;
 use crossterm::style::{Attribute, SetAttribute};
 use mdtext::{Alignment, Event, ListKind, Options, Parser, Tag};
 use osc8::Hyperlink;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
@@ -109,6 +110,25 @@ struct Span {
 }
 
 impl Text {
+  fn wrap(&self, width: usize) -> Vec<Self> {
+    let mut lines = Vec::new();
+    let (mut start, mut used, mut space) = (0, 0, 0);
+    for (pos, g) in self.text.grapheme_indices(true) {
+      if used + g.width() > width && pos > start {
+        let end = if space > start { space } else { pos };
+        lines.push(self.slice(start..end));
+        start = end;
+        used = self.text[start..pos].width();
+      }
+      used += g.width();
+      if g.chars().all(char::is_whitespace) {
+        space = pos + g.len();
+      }
+    }
+    lines.push(self.slice(start..self.text.len()));
+    lines
+  }
+
   fn slice(&self, range: Range<usize>) -> Self {
     let mut out = Self::default();
     let mut pos = 0;
@@ -209,6 +229,10 @@ struct Open {
 #[derive(Default)]
 struct Render {
   text: Text,
+  width: usize,
+  // Replaying an open container for preview must retain its already emitted table layouts.
+  table_widths: Vec<usize>,
+  table_index: usize,
   stack: Vec<Open>,
   style: Style,
   link: Option<Rc<Link>>,
@@ -382,7 +406,22 @@ impl Render {
   }
 
   fn table(&mut self, table: Table) {
-    let widths: Vec<_> = (0..table.align.len())
+    let width = self.table_widths.get(self.table_index).copied().unwrap_or_else(|| {
+      self.table_widths.push(self.width);
+      self.width
+    });
+    self.table_index += 1;
+    let indent: usize = self
+      .stack
+      .iter()
+      .map(|open| match open.kind {
+        Kind::Quote => 2,
+        Kind::Item(width, _) => width,
+        _ => 0,
+      })
+      .sum();
+    let width = width.saturating_sub(indent);
+    let mut widths: Vec<_> = (0..table.align.len())
       .map(|i| {
         table
           .rows
@@ -394,38 +433,121 @@ impl Render {
           .max(1)
       })
       .collect();
+    let minimum: Vec<_> = (0..widths.len())
+      .map(|i| {
+        table
+          .rows
+          .iter()
+          .filter_map(|row| row.get(i))
+          .flat_map(|cell| cell.text.graphemes(true))
+          .map(str::width)
+          .max()
+          .unwrap_or(1)
+          .max(1)
+      })
+      .collect();
+    let separators = widths.len().saturating_sub(1) * 3;
     let style = self.style;
     let link = self.link.take();
+    // If even one grapheme per column cannot fit, show labelled cells in reading order.
+    if minimum.iter().sum::<usize>() + separators + 2 > width {
+      for (r, row) in table.rows.iter().enumerate() {
+        if r == 0 && table.rows.len() > 1 {
+          continue;
+        }
+        self.space(2);
+        for (i, cell) in row.iter().enumerate() {
+          self.space(1);
+          if r > 0
+            && let Some(header) = table.rows[0].get(i)
+            && !header.text.is_empty()
+          {
+            for (text, style, link) in header.parts() {
+              self.style = style;
+              self.link = link.cloned();
+              self.push(text);
+            }
+            self.style = Style::default();
+            self.link = None;
+            self.push(": ");
+          }
+          for (text, style, link) in cell.parts() {
+            self.style = style;
+            self.link = link.cloned();
+            self.push(text);
+          }
+        }
+      }
+      self.style = style;
+      self.link = link;
+      self.space(2);
+      return;
+    }
+    // Cap wide columns evenly, leaving short columns at their natural width.
+    let available = width - separators - 2;
+    let total =
+      |cap| widths.iter().zip(&minimum).map(|(&w, &min)| w.min(cap).max(min)).sum::<usize>();
+    let (mut low, mut high) = (0, widths.iter().copied().max().unwrap_or(0));
+    while low < high {
+      let cap = low + (high - low).div_ceil(2);
+      if total(cap) <= available {
+        low = cap;
+      } else {
+        high = cap - 1;
+      }
+    }
+    let mut spare = available - total(low);
+    for (w, &min) in widths.iter_mut().zip(&minimum) {
+      let cap = (*w).min(low).max(min);
+      let extra = usize::from(spare > 0 && *w > cap);
+      *w = cap + extra;
+      spare -= extra;
+    }
     for (r, row) in table.rows.iter().enumerate() {
       if r > 0 {
         self.space(1);
       }
-      for (i, cell) in row.iter().enumerate() {
-        self.style = Style::default();
-        if i > 0 {
-          self.decor(" │ ");
-        }
-        let pad = widths[i].saturating_sub(cell.text.width());
-        let left = match table.align[i] {
-          Alignment::Right => pad,
-          Alignment::Center => pad / 2,
-          _ => 0,
-        };
-        self.push(&" ".repeat(left));
-        for (text, style, link) in cell.parts() {
-          self.style = style;
-          self.link = link.cloned();
-          self.push(text);
+      let cells: Vec<_> = row.iter().zip(&widths).map(|(cell, &width)| cell.wrap(width)).collect();
+      for line in 0..cells.iter().map(Vec::len).max().unwrap_or(0) {
+        if line > 0 {
+          self.space(1);
         }
         self.style = Style::default();
         self.link = None;
-        if i + 1 < widths.len() {
-          self.push(&" ".repeat(pad - left));
+        self.push(" ");
+        for (i, &width) in widths.iter().enumerate() {
+          let cell = cells.get(i).and_then(|lines| lines.get(line));
+          self.style = Style::default();
+          self.link = None;
+          if i > 0 {
+            self.decor(" │ ");
+          }
+          let pad = width.saturating_sub(cell.map_or(0, |cell| cell.text.width()));
+          let left = match table.align[i] {
+            Alignment::Right => pad,
+            Alignment::Center => pad / 2,
+            _ => 0,
+          };
+          self.push(&" ".repeat(left));
+          for (text, style, link) in cell.into_iter().flat_map(Text::parts) {
+            self.style = style;
+            self.link = link.cloned();
+            self.push(text);
+          }
+          self.style = Style::default();
+          self.link = None;
+          if i + 1 < widths.len() {
+            self.push(&" ".repeat(pad - left));
+          }
         }
+        self.push(" ");
       }
       if r == 0 || r + 1 < table.rows.len() {
         self.space(1);
-        self.decor(&widths.iter().map(|&width| "─".repeat(width)).collect::<Vec<_>>().join("─┼─"));
+        self.decor(&format!(
+          " {} ",
+          widths.iter().map(|&width| "─".repeat(width)).collect::<Vec<_>>().join("─┼─")
+        ));
       }
     }
     self.style = style;
@@ -599,9 +721,13 @@ impl Default for Markdown {
 }
 
 impl Markdown {
-  pub fn update(&mut self, source: &str, complete: bool) -> &Text {
+  pub fn update(&mut self, source: &str, complete: bool, cols: u16) -> &Text {
+    let width = usize::from(cols.saturating_sub(1).max(1));
+    let resized = self.render.width != width;
+    self.render.width = width;
+    let changed = source.len() > self.seen;
     // mdtext keeps unresolved syntax; feed only its unread suffix, never reparse history.
-    if source.len() > self.seen {
+    if changed {
       let mut events = self.parser.feed(&source[self.read..]);
       for event in events.by_ref() {
         self.render.event(event);
@@ -612,10 +738,12 @@ impl Markdown {
       if self.render.stack.is_empty() {
         self.preview_start = self.read;
         self.preview_shown = self.render.text.text.len();
+        self.render.table_widths.clear();
+        self.render.table_index = 0;
       }
-      if !complete {
-        self.preview = self.pending(source);
-      }
+    }
+    if !complete && (changed || resized) {
+      self.preview = self.pending(source);
     }
     if complete {
       for event in self.parser.finish_iter(&source[self.read..]) {
@@ -656,6 +784,8 @@ impl Markdown {
     let shown =
       self.render.text.text[self.preview_shown..self.committed_len()].trim_start_matches('\n');
     let mut render = Render {
+      width: self.render.width,
+      table_widths: self.render.table_widths.clone(),
       seed: self.render.code.clone().map(|code| (shown.len(), code)),
       ..Render::default()
     };
@@ -677,7 +807,7 @@ mod tests {
 
   fn render(source: &str) -> Text {
     let mut markdown = Markdown::default();
-    markdown.update(source, true);
+    markdown.update(source, true, 80);
     markdown.render.text
   }
 
@@ -740,7 +870,7 @@ mod tests {
 
     assert_eq!(
       render(WIDE).text,
-      "9. nine\n10. ten\n    - nested\n\n    A │ B\n    ──┼──\n    1 │ 2\n\n11. eleven\n\n\
+      "9. nine\n10. ten\n    - nested\n\n     A │ B \n     ──┼── \n     1 │ 2 \n\n11. eleven\n\n\
       - > quote\n  >\n  > > inner"
     );
   }
@@ -785,7 +915,7 @@ mod tests {
     let link = text.parts().find(|(part, ..)| *part == "link").unwrap();
     assert_eq!((link.1, link.2.is_some()), (Style::default().colour(CYAN), true));
     assert_eq!(styled(&text, "│"), [(" │ ", faint), (" │ ", faint)]);
-    assert_eq!(styled(&text, "┼"), [("──┼──", faint)]);
+    assert_eq!(styled(&text, "┼"), [(" ──┼── ", faint)]);
     assert_eq!(styled(&text, "────────"), [("────────", faint)]);
     assert_eq!(styled(&text, ">"), [("> ", faint)]);
     assert_eq!(styled(&text, "quote"), [("quote", Style::default())]);
@@ -934,14 +1064,14 @@ mod tests {
       let mut previous = Vec::new();
       // Every prefix splits a line or a token somewhere; committed spans and styles never change.
       for (i, c) in source.char_indices() {
-        let text = markdown.update(&source[..i + c.len_utf8()], false);
+        let text = markdown.update(&source[..i + c.len_utf8()], false, 80);
         let len = previous.iter().map(|(part, _): &(String, Style)| part.len()).sum::<usize>();
         let committed: Vec<_> =
           text.slice(0..len).parts().map(|(part, style, _)| (part.to_owned(), style)).collect();
         assert_eq!(committed, previous, "changed emitted text for {source:?}");
         previous = text.parts().map(|(part, style, _)| (part.to_owned(), style)).collect();
       }
-      assert_eq!(parts(markdown.update(source, true)), parts(&expected), "{source:?}");
+      assert_eq!(parts(markdown.update(source, true, 80)), parts(&expected), "{source:?}");
       assert!(!expected.text.contains('\x1b'));
     }
   }
@@ -949,26 +1079,26 @@ mod tests {
   #[test]
   fn unfinished_blocks_have_a_preview_without_changing_committed_text() {
     let mut markdown = Markdown::default();
-    assert!(markdown.update("**hello", false).text.is_empty());
+    assert!(markdown.update("**hello", false, 80).text.is_empty());
     assert_eq!(markdown.preview().text, "**hello");
-    assert!(markdown.update("**hello** world", false).text.is_empty());
+    assert!(markdown.update("**hello** world", false, 80).text.is_empty());
     assert_eq!(markdown.preview().text, "hello world");
     let mut out = Vec::new();
     markdown.preview().write(&mut out, 0..11).unwrap();
     assert!(String::from_utf8(out).unwrap().contains("\x1b[1mhello"));
-    assert_eq!(markdown.update("**hello** world\n\nnext", false).text, "hello world");
+    assert_eq!(markdown.update("**hello** world\n\nnext", false, 80).text, "hello world");
     assert_eq!(markdown.preview().text, "next");
-    assert_eq!(markdown.update("**hello** world\n\nnext", true).text, "hello world\n\nnext");
+    assert_eq!(markdown.update("**hello** world\n\nnext", true, 80).text, "hello world\n\nnext");
     assert!(markdown.preview().text.is_empty());
 
     for (source, committed, pending) in [
       ("```rust\nfn", "```rust\n", "fn\n```"),
       ("- first\n- sec", "", "- first\n- sec"),
-      ("| A | B |\n| - | - |\n| one | tw", "", "A   │ B\n────┼───\none │ tw"),
+      ("| A | B |\n| - | - |\n| one | tw", "", " A   │ B \n ────┼─── \n one │ tw "),
     ] {
       let mut markdown = Markdown::default();
       for (i, c) in source.char_indices() {
-        markdown.update(&source[..i + c.len_utf8()], false);
+        markdown.update(&source[..i + c.len_utf8()], false, 80);
       }
       assert_eq!(&markdown.text().text[..markdown.committed_len()], committed, "{source:?}");
       assert_eq!(markdown.preview().text, pending, "{source:?}");
@@ -978,7 +1108,7 @@ mod tests {
     let mut markdown = Markdown::default();
     let source = "```rust\n/* open\nstill */ fn";
     for (i, c) in source.char_indices() {
-      markdown.update(&source[..i + c.len_utf8()], false);
+      markdown.update(&source[..i + c.len_utf8()], false, 80);
     }
     let comment = Style::default().with(Style::FAINT | Style::ITALIC);
     assert_eq!(styled(markdown.text(), "open"), [("/* open\n", comment)]);
@@ -1005,30 +1135,30 @@ mod tests {
     let mut markdown = Markdown::default();
     for (i, c) in source.char_indices() {
       let prefix = &source[..i + c.len_utf8()];
-      markdown.update(prefix, false);
+      markdown.update(prefix, false, 80);
       assert_eq!(parts(&joined(&markdown)), parts(&render(prefix)), "{prefix:?}");
     }
     let mut markdown = Markdown::default();
-    markdown.update(source, false);
+    markdown.update(source, false, 80);
     assert_eq!(parts(&joined(&markdown)), parts(&render(source)));
 
     let source = "界".repeat(20000);
     let mut markdown = Markdown::default();
-    assert!(markdown.update(&source, false).text.is_empty());
+    assert!(markdown.update(&source, false, 80).text.is_empty());
     assert_eq!(markdown.preview().text, "界".repeat(4096));
-    assert_eq!(markdown.update(&source, true).text, source);
+    assert_eq!(markdown.update(&source, true, 80).text, source);
   }
 
   #[test]
   fn closed_blocks_and_code_lines_arrive_before_the_stream_finishes() {
     let mut markdown = Markdown::default();
     let first = "# Ready\n\n";
-    assert_eq!(markdown.update(first, false).text, "Ready");
+    assert_eq!(markdown.update(first, false, 80).text, "Ready");
     let second = format!("{first}```rust\nfn main() {{}}\n");
-    assert!(markdown.update(&second, false).text.contains("fn main() {}\n"));
+    assert!(markdown.update(&second, false, 80).text.contains("fn main() {}\n"));
     let third = format!("{second}    // still streaming\n");
-    assert!(markdown.update(&third, false).text.ends_with("    // still streaming\n"));
-    assert!(markdown.update(&third, true).text.ends_with("\n```"));
+    assert!(markdown.update(&third, false, 80).text.ends_with("    // still streaming\n"));
+    assert!(markdown.update(&third, true, 80).text.ends_with("\n```"));
   }
 
   #[test]
@@ -1039,21 +1169,21 @@ mod tests {
     let text = render(source);
     assert_eq!(
       text.text,
-      "Before\n\nЯзык     │ Строк кода\n─────────┼───────────\n\
-      Rust     │      3 304\n─────────┼───────────\n\
-      Python   │        621\n─────────┼───────────\n\
-      TOML     │         26\n─────────┼───────────\n\
-      Makefile │         19\n─────────┼───────────\nВсего    │      3 970\n\nAfter"
+      "Before\n\n Язык     │ Строк кода \n ─────────┼─────────── \n \
+      Rust     │      3 304 \n ─────────┼─────────── \n \
+      Python   │        621 \n ─────────┼─────────── \n \
+      TOML     │         26 \n ─────────┼─────────── \n \
+      Makefile │         19 \n ─────────┼─────────── \n Всего    │      3 970 \n\nAfter"
     );
     let mut streamed = Markdown::default();
     for (i, c) in source.char_indices() {
       let prefix = &source[..i + c.len_utf8()];
-      let output = streamed.update(prefix, false);
+      let output = streamed.update(prefix, false, 80);
       if !prefix.contains("| **3 970** |\n\n") {
         assert!(!output.text.contains("Язык"), "table must wait for its final column widths");
       }
     }
-    assert_eq!(streamed.update(source, true), &text);
+    assert_eq!(streamed.update(source, true, 80), &text);
     let mut out = Vec::new();
     text.write(&mut out, 0..text.text.len()).unwrap();
     let out = String::from_utf8(out).unwrap();
@@ -1064,15 +1194,103 @@ mod tests {
       | 界 | **abcdef** | 1234 |\n| 👩‍💻 | e\u{301} | 2 |\n| | | |\n",
     );
     let lines: Vec<_> = text.text.lines().collect();
-    assert_eq!(lines[0], "L  │   C    │    R");
-    assert_eq!(lines[1], "───┼────────┼─────");
-    assert_eq!(lines[2], "界 │ abcdef │ 1234");
+    assert_eq!(lines[0], " L  │   C    │    R ");
+    assert_eq!(lines[1], " ───┼────────┼───── ");
+    assert_eq!(lines[2], " 界 │ abcdef │ 1234 ");
     assert_eq!(lines[3], lines[1]);
-    assert_eq!(lines[4], "👩‍💻 │   e\u{301}    │    2");
+    assert_eq!(lines[4], " 👩‍💻 │   e\u{301}    │    2 ");
     assert_eq!(lines[5], lines[1]);
     for line in lines.iter().filter(|line| line.contains('│')) {
-      assert_eq!(line.split('│').map(str::width).collect::<Vec<_>>(), [3, 8, 5]);
+      assert_eq!(line.split('│').map(str::width).collect::<Vec<_>>(), [4, 8, 6]);
     }
+  }
+
+  #[test]
+  fn narrow_tables_wrap_cells_and_keep_alignment_links_and_graphemes() {
+    let source = "| Left | Center | Right |\n| :--- | :---: | ---: |\n\
+      | [**long label 界 👩‍💻 e\u{301}**](https://example.org) | *middle* | 1234567 |\n\
+      | plain | | -0.25 |\n";
+    for cols in [12, 20, 40, 80] {
+      for prefix in ["", "> ", "> > "] {
+        let source = source.lines().map(|line| format!("{prefix}{line}\n")).collect::<String>();
+        let mut markdown = Markdown::default();
+        let text = markdown.update(&source, true, cols);
+        // Very narrow nested tables use labelled cells and terminal-native wrapping.
+        if text.text.contains('│') {
+          assert!(text.text.lines().all(|line| line.width() < usize::from(cols)), "{}", text.text);
+          let borders: Vec<_> = text.text.lines().filter(|line| line.contains('┼')).collect();
+          assert_eq!(borders.len(), 2);
+          assert_eq!(borders[0], borders[1]);
+          let columns: Vec<_> = text
+            .text
+            .lines()
+            .filter(|line| line.contains('│'))
+            .map(|line| line.split('│').map(str::width).collect::<Vec<_>>())
+            .collect();
+          assert!(columns.iter().all(|row| row[..2] == columns[0][..2]));
+        }
+        let linked: String = text
+          .parts()
+          .filter(|(_, _, link)| link.is_some())
+          .map(|(part, style, _)| {
+            assert_eq!(style, Style::default().with(Style::BOLD));
+            part
+          })
+          .collect();
+        assert_eq!(linked, "long label 界 👩‍💻 e\u{301}");
+        assert!(!text.text.contains('�'));
+      }
+    }
+    let mut markdown = Markdown::default();
+    let text = markdown.update(
+      "| A | B | C |\n| - | - | - |\n| abcdefghi | abcdefghi | abcdefghi |",
+      true,
+      21,
+    );
+    assert_eq!(
+      text.text,
+      " A    │ B    │ C \n ─────┼──────┼───── \n \
+      abcd │ abcd │ abcd \n efgh │ efgh │ efgh \n i    │ i    │ i "
+    );
+    for cols in [1, 4, 8] {
+      let mut markdown = Markdown::default();
+      assert_eq!(
+        markdown.update("| A | B | C |\n| - | - | - |\n| 界 | 42 | |", true, cols).text,
+        "A: 界\nB: 42\nC: "
+      );
+    }
+  }
+
+  #[test]
+  fn table_preview_reflows_without_new_input_or_changes_to_emitted_tables() {
+    let first = "> | L | R |\n> | - | -: |\n> | long cell with spaces | 42 |\n";
+    let mut markdown = Markdown::default();
+    for (i, c) in first.char_indices() {
+      markdown.update(&first[..i + c.len_utf8()], false, 60);
+    }
+    assert!(markdown.preview().text.contains("long cell with spaces"));
+    for cols in [18, 40, 18] {
+      markdown.update(first, false, cols);
+      let mut full = Markdown::default();
+      assert_eq!(parts(markdown.preview()), parts(full.update(first, true, cols)));
+      assert!(markdown.preview().text.lines().all(|line| line.width() < usize::from(cols)));
+    }
+    // A completed table inside a still-open quote keeps its original layout when replayed
+    // to build the following block's preview at a different terminal width.
+    let source = format!("{first}>\n> pending paragraph");
+    markdown.update(&source, false, 40);
+    let committed = markdown.text().text.clone();
+    assert!(committed.contains("long cell with spaces"));
+    for cols in [18, 80] {
+      markdown.update(&source, false, cols);
+      assert_eq!(markdown.text().text, committed);
+      assert_eq!(markdown.preview().text, "\n>\n> pending paragraph");
+    }
+    let source = format!("{source}\n>\n> | Next | R |\n> | - | - |\n> | another wide cell | 7 |");
+    markdown.update(&source, false, 18);
+    assert!(!markdown.preview().text.is_empty());
+    assert!(markdown.preview().text.lines().all(|line| line.width() < 18));
+    assert!(markdown.update(&source, true, 18).text.starts_with(&committed));
   }
 
   #[test]
@@ -1127,9 +1345,14 @@ mod tests {
     }
 
     let text = render("| File |\n| --- |\n| [`main`](src/main.rs) |\n");
-    assert_eq!(text.text, "File\n────\nmain");
+    assert_eq!(text.text, " File \n ──── \n main ");
     let uri = Url::from_file_path(std::env::current_dir().unwrap().join("src/main.rs")).unwrap();
-    assert_eq!(parts(&text).last().unwrap().2, Some(uri.as_str()));
+    assert_eq!(styled(&text, "main"), [("main", Style::default().colour(CYAN))]);
+    assert_eq!(
+      text.parts().find(|(part, ..)| *part == "main").unwrap().2.unwrap().uri,
+      uri.as_str()
+    );
+    assert_eq!(parts(&text).last().unwrap().2, None, "link must not include table padding");
     let uri = Link::new("/tmp/Мой файл%23name.rs").unwrap().uri.clone();
     assert_eq!(uri, "file:///tmp/%D0%9C%D0%BE%D0%B9%20%D1%84%D0%B0%D0%B9%D0%BB%23name.rs");
     for target in
