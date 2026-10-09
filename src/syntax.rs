@@ -1,236 +1,101 @@
-use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::LazyLock;
 
-use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+use syntect::highlighting::{
+  Color, FontStyle, HighlightState, Highlighter, RangedHighlightIterator, StyleModifier, Theme,
+  ThemeItem,
+};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
-const SCOPES: &[&str] = &[
-  "comment",
-  "keyword",
-  "string",
-  "character",
-  "number",
-  "float",
-  "boolean",
-  "constant",
-  "function",
-  "type",
-  "constructor",
-  "namespace",
-  "diff.plus",
-  "diff.minus",
-  "scope",
-  "comment.open",
-  "string.open",
-];
+const RED: u8 = 31;
+const GREEN: u8 = 32;
+const YELLOW: u8 = 33;
+const BLUE: u8 = 34;
+const MAGENTA: u8 = 35;
+const CYAN: u8 = 36;
 
-thread_local! {
-  static HIGHLIGHTER: RefCell<Highlighter> = RefCell::new(Highlighter::new());
-}
+// Loaded on the first fenced block with a language; bat's set adds TypeScript, TOML and others.
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 
-// Only the open code block is retained. Preview clones cannot change committed state.
+// A theme only selects scopes: red carries the SGR colour code, 0 keeps the default foreground.
+// Italic is reserved for comments, which render faint and italic.
+static THEME: LazyLock<Theme> = LazyLock::new(|| {
+  let item = |scope: &str, code: u8, font_style| ThemeItem {
+    scope: scope.parse().unwrap(),
+    style: StyleModifier {
+      foreground: Some(Color { r: code, g: 0, b: 0, a: 0 }),
+      background: None,
+      font_style,
+    },
+  };
+  let mut scopes = vec![item("comment", 0, Some(FontStyle::ITALIC))];
+  scopes.extend(
+    [
+      ("keyword, storage, keyword.operator.word", MAGENTA),
+      ("keyword.operator", 0),
+      ("string, markup.inserted", GREEN),
+      ("markup.deleted", RED),
+      ("constant.numeric, constant.language", YELLOW),
+      ("entity.name.function, support.function, support.macro, variable.function", BLUE),
+      (
+        "entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, \
+        entity.name.trait, entity.name.interface, entity.other.inherited-class, support.type, \
+        support.class",
+        CYAN,
+      ),
+    ]
+    .map(|(scope, code)| item(scope, code, None)),
+  );
+  Theme { scopes, ..Theme::default() }
+});
+
+static HIGHLIGHTER: LazyLock<Highlighter<'static>> = LazyLock::new(|| Highlighter::new(&THEME));
+
+// Parser state carries multi-line comments and strings from one code line to the next.
 #[derive(Clone)]
 pub struct Code {
-  config: &'static HighlightConfiguration,
-  source: String,
+  parse: ParseState,
+  highlight: HighlightState,
 }
 
 impl Code {
   pub fn new(lang: &str) -> Option<Self> {
-    Some(Self { config: config(lang)?, source: String::new() })
+    let lang = lang.to_ascii_lowercase();
+    let lang = match lang.as_str() {
+      "shell" => "sh",
+      "golang" => "go",
+      _ => &lang,
+    };
+    let syntax = SYNTAXES.find_syntax_by_token(lang)?;
+    Some(Self {
+      parse: ParseState::new(syntax),
+      highlight: HighlightState::new(&HIGHLIGHTER, ScopeStack::new()),
+    })
   }
 
   pub fn line(&mut self, line: &str) -> Option<Vec<(&'static str, Range<usize>)>> {
-    let offset = self.source.len();
-    self.source.push_str(line);
-    HIGHLIGHTER.with_borrow_mut(|highlighter| {
-      // The closure coerces static configurations to the highlighter's shorter borrow.
-      #[allow(clippy::redundant_closure)]
-      let events = highlighter
-        .highlight(self.config, self.source.as_bytes(), None, None, |name| config(name))
-        .ok()?;
-      let mut scopes = Vec::new();
-      let mut parts = Vec::new();
-      let mut open = None;
-      for event in events {
-        match event.ok()? {
-          HighlightEvent::HighlightStart(highlight) => {
-            let scope = SCOPES[highlight.0];
-            // A parser-recognized opening delimiter colours the unfinished token up to
-            // its language boundary, including when that language is injected into Markdown.
-            if open.is_none()
-              && let Some(scope) = scope.strip_suffix(".open")
-              && let Some(depth) = scopes.iter().rposition(|&name| name == "scope")
-            {
-              open = Some((scope, depth));
+    let ops = self.parse.parse_line(line, &SYNTAXES).ok()?;
+    let parts = RangedHighlightIterator::new(&mut self.highlight, &ops, line, &HIGHLIGHTER);
+    Some(
+      parts
+        .map(|(style, _, range)| {
+          let scope = if style.font_style.contains(FontStyle::ITALIC) {
+            "comment"
+          } else {
+            match style.foreground.r {
+              RED => "diff.minus",
+              GREEN => "string",
+              YELLOW => "number",
+              BLUE => "function",
+              MAGENTA => "keyword",
+              CYAN => "type",
+              _ => "",
             }
-            scopes.push(scope);
-          }
-          HighlightEvent::HighlightEnd => {
-            scopes.pop();
-            if open.is_some_and(|(_, depth)| scopes.len() <= depth) {
-              open = None;
-            }
-          }
-          HighlightEvent::Source { start, end } if end > offset => {
-            parts.push((
-              open.map(|(scope, _)| scope).or_else(|| scopes.last().copied()).unwrap_or(""),
-              start.saturating_sub(offset)..end - offset,
-            ));
-          }
-          _ => {}
-        }
-      }
-      Some(parts)
-    })
-  }
-}
-
-fn config(lang: &str) -> Option<&'static HighlightConfiguration> {
-  // Each grammar's queries are compiled once, on first use, including injected languages.
-  macro_rules! grammar {
-    ($name:literal, $language:expr, $highlights:expr) => {
-      grammar!($name, $language, $highlights, "", "")
-    };
-    ($name:literal, $language:expr, $highlights:expr, $injections:expr, $locals:expr) => {{
-      static CONFIG: LazyLock<Option<HighlightConfiguration>> = LazyLock::new(|| {
-        let mut config = HighlightConfiguration::new(
-          $language.into(),
-          $name,
-          &$highlights,
-          &$injections,
-          &$locals,
-        )
-        .ok()?;
-        config.configure(SCOPES);
-        Some(config)
-      });
-      CONFIG.as_ref()
-    }};
-  }
-
-  match lang.to_ascii_lowercase().as_str() {
-    "rust" | "rs" => grammar!(
-      "rust",
-      tree_sitter_rust::LANGUAGE,
-      format!(
-        "{}\n{}",
-        tree_sitter_rust::HIGHLIGHTS_QUERY,
-        r#"
-        (source_file) @scope
-        (ERROR "fn" . (identifier) @function)
-        (ERROR "/*" @comment.open)
-        (ERROR "\"" @string.open)
-      "#
-      ),
-      tree_sitter_rust::INJECTIONS_QUERY,
-      ""
-    ),
-    "python" | "py" => {
-      grammar!(
-        "python",
-        tree_sitter_python::LANGUAGE,
-        format!(
-          "{}\n{}",
-          tree_sitter_python::HIGHLIGHTS_QUERY,
-          "(module) @scope\n(ERROR (string_start) @string.open)"
-        )
-      )
-    }
-    "javascript" | "js" | "jsx" => grammar!(
-      "javascript",
-      tree_sitter_javascript::LANGUAGE,
-      format!(
-        "{}\n{}",
-        tree_sitter_javascript::HIGHLIGHT_QUERY,
-        tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
-      ),
-      tree_sitter_javascript::INJECTIONS_QUERY,
-      tree_sitter_javascript::LOCALS_QUERY
-    ),
-    "typescript" | "ts" => grammar!(
-      "typescript",
-      tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-      format!(
-        "{}\n{}",
-        tree_sitter_javascript::HIGHLIGHT_QUERY,
-        tree_sitter_typescript::HIGHLIGHTS_QUERY
-      ),
-      tree_sitter_javascript::INJECTIONS_QUERY,
-      tree_sitter_typescript::LOCALS_QUERY
-    ),
-    "tsx" => grammar!(
-      "tsx",
-      tree_sitter_typescript::LANGUAGE_TSX,
-      format!(
-        "{}\n{}\n{}",
-        tree_sitter_javascript::HIGHLIGHT_QUERY,
-        tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-        tree_sitter_typescript::HIGHLIGHTS_QUERY
-      ),
-      tree_sitter_javascript::INJECTIONS_QUERY,
-      tree_sitter_typescript::LOCALS_QUERY
-    ),
-    "bash" | "sh" | "shell" => {
-      grammar!("bash", tree_sitter_bash::LANGUAGE, tree_sitter_bash::HIGHLIGHT_QUERY)
-    }
-    "json" => grammar!("json", tree_sitter_json::LANGUAGE, tree_sitter_json::HIGHLIGHTS_QUERY),
-    "sql" => grammar!("sql", tree_sitter_sequel::LANGUAGE, tree_sitter_sequel::HIGHLIGHTS_QUERY),
-    "diff" | "patch" => grammar!(
-      "diff",
-      tree_sitter_diff::LANGUAGE,
-      tree_sitter_diff::HIGHLIGHTS_QUERY
-        .replace("@string", "@diff.plus")
-        .replace("@keyword", "@diff.minus")
-    ),
-    "markdown" | "md" => grammar!(
-      "markdown",
-      tree_sitter_md::LANGUAGE,
-      tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
-      // Include children so injected code retains all its text ranges during streaming.
-      "((fenced_code_block (info_string (language) @injection.language)
-        (code_fence_content) @injection.content) (#set! injection.include-children))
-       ((inline) @injection.content (#set! injection.language \"markdown_inline\")
-        (#set! injection.include-children))",
-      ""
-    ),
-    "markdown_inline" => grammar!(
-      "markdown_inline",
-      tree_sitter_md::INLINE_LANGUAGE,
-      tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
-      tree_sitter_md::INJECTION_QUERY_INLINE,
-      ""
-    ),
-    "toml" => {
-      grammar!("toml", tree_sitter_toml_ng::LANGUAGE, tree_sitter_toml_ng::HIGHLIGHTS_QUERY)
-    }
-    "yaml" | "yml" => {
-      grammar!("yaml", tree_sitter_yaml::LANGUAGE, tree_sitter_yaml::HIGHLIGHTS_QUERY)
-    }
-    "html" => grammar!(
-      "html",
-      tree_sitter_html::LANGUAGE,
-      tree_sitter_html::HIGHLIGHTS_QUERY,
-      tree_sitter_html::INJECTIONS_QUERY,
-      ""
-    ),
-    "css" => grammar!("css", tree_sitter_css::LANGUAGE, tree_sitter_css::HIGHLIGHTS_QUERY),
-    "c" => grammar!("c", tree_sitter_c::LANGUAGE, tree_sitter_c::HIGHLIGHT_QUERY),
-    "cpp" | "c++" => grammar!(
-      "cpp",
-      tree_sitter_cpp::LANGUAGE,
-      format!("{}\n{}", tree_sitter_c::HIGHLIGHT_QUERY, tree_sitter_cpp::HIGHLIGHT_QUERY)
-    ),
-    "go" | "golang" => grammar!("go", tree_sitter_go::LANGUAGE, tree_sitter_go::HIGHLIGHTS_QUERY),
-    "java" => grammar!("java", tree_sitter_java::LANGUAGE, tree_sitter_java::HIGHLIGHTS_QUERY),
-    "ruby" | "rb" => grammar!(
-      "ruby",
-      tree_sitter_ruby::LANGUAGE,
-      tree_sitter_ruby::HIGHLIGHTS_QUERY,
-      "",
-      tree_sitter_ruby::LOCALS_QUERY
-    ),
-    _ => None,
+          };
+          (scope, range)
+        })
+        .collect(),
+    )
   }
 }
 
@@ -239,42 +104,49 @@ mod tests {
   use super::*;
 
   #[test]
-  fn bundled_queries_compile_and_aliases_share_configs() {
+  fn bundled_languages_and_existing_aliases_are_available() {
     for lang in [
       "rust",
+      "rs",
       "python",
+      "py",
       "javascript",
+      "js",
+      "JS",
+      "jsx",
       "typescript",
+      "ts",
       "tsx",
       "bash",
+      "sh",
+      "shell",
       "json",
       "sql",
       "diff",
+      "patch",
       "markdown",
-      "markdown_inline",
+      "md",
       "toml",
       "yaml",
+      "yml",
       "html",
       "css",
       "c",
       "cpp",
+      "c++",
       "go",
+      "golang",
       "java",
       "ruby",
+      "rb",
+      "kotlin",
+      "swift",
+      "lua",
+      "cs",
+      "php",
     ] {
-      assert!(config(lang).is_some(), "{lang}");
+      assert!(Code::new(lang).is_some(), "{lang}");
     }
-    for (alias, name) in [
-      ("rs", "rust"),
-      ("py", "python"),
-      ("JS", "javascript"),
-      ("ts", "typescript"),
-      ("sh", "bash"),
-      ("yml", "yaml"),
-      ("md", "markdown"),
-    ] {
-      assert!(std::ptr::eq(config(alias).unwrap(), config(name).unwrap()));
-    }
-    assert!(config("robotlang").is_none());
+    assert!(Code::new("robotlang").is_none());
   }
 }

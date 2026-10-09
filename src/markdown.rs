@@ -796,15 +796,22 @@ mod tests {
   fn fenced_code_highlights_known_languages_and_leaves_others_plain() {
     let comment = Style::default().with(Style::FAINT | Style::ITALIC);
     let colour = |code| Style::default().colour(code);
+    // Check token cells, independent of how a grammar groups adjoining whitespace.
+    let check = |text: &Text, token: &str, expected: Style| {
+      let start = text.text.find(token).unwrap();
+      for (_, style, _) in text.slice(start..start + token.len()).parts() {
+        assert_eq!(style, expected, "{token:?}");
+      }
+    };
     let text = render(
       "```rust\nfn main() {\n  // note\n  let s = \"hi\"; let n = 42; let b = true;\n}\n```",
     );
-    assert_eq!(styled(&text, "fn"), [("fn", colour(MAGENTA))]);
-    assert_eq!(styled(&text, "main"), [("main", colour(BLUE))]);
-    assert_eq!(styled(&text, "// note"), [("// note", comment)]);
-    assert_eq!(styled(&text, "hi"), [("\"hi\"", colour(GREEN))]);
-    assert_eq!(styled(&text, "42"), [("42", colour(YELLOW))]);
-    assert_eq!(styled(&text, "true"), [("true", colour(YELLOW))]);
+    check(&text, "fn", colour(MAGENTA));
+    check(&text, "main", colour(BLUE));
+    check(&text, "// note", comment);
+    check(&text, "\"hi\"", colour(GREEN));
+    check(&text, "42", colour(YELLOW));
+    check(&text, "true", colour(YELLOW));
     // Operators, punctuation and variables keep the default foreground.
     assert!(styled(&text, "=").iter().all(|(_, style)| *style == Style::default()));
     assert!(styled(&text, "{").iter().all(|(_, style)| *style == Style::default()));
@@ -812,13 +819,13 @@ mod tests {
     let text = render(
       "```python\ndef greet(robot: Robot) -> str:\n    # note\n    return f\"hi {robot}\" or 42 or None\n```",
     );
-    assert_eq!(styled(&text, "def"), [("def", colour(MAGENTA))]);
-    assert_eq!(styled(&text, "greet"), [("greet", colour(BLUE))]);
-    assert_eq!(styled(&text, "str"), [("str", colour(CYAN))]);
-    assert_eq!(styled(&text, "# note"), [("# note", comment)]);
-    assert_eq!(styled(&text, "return"), [("return", colour(MAGENTA))]);
-    assert_eq!(styled(&text, "42"), [("42", colour(YELLOW))]);
-    assert_eq!(styled(&text, "None"), [("None", colour(YELLOW))]);
+    check(&text, "def", colour(MAGENTA));
+    check(&text, "greet", colour(BLUE));
+    check(&text, "str", colour(CYAN));
+    check(&text, "# note", comment);
+    check(&text, "return", colour(MAGENTA));
+    check(&text, "42", colour(YELLOW));
+    check(&text, "None", colour(YELLOW));
 
     for lang in ["typescript", "ts", "bash", "json", "sql", "diff"] {
       let text = render(&format!("```{lang}\nx\n```"));
@@ -826,11 +833,11 @@ mod tests {
       assert_eq!(text.text, format!("```{lang}\nx\n```"));
     }
     let text = render("```ts\nconst x: number = 42;\n```");
-    assert_eq!(styled(&text, "const"), [("const", colour(MAGENTA))]);
-    assert_eq!(styled(&text, "number"), [("number", colour(CYAN))]);
+    check(&text, "const", colour(MAGENTA));
+    check(&text, "number", colour(CYAN));
     let text = render("```diff\n-old\n+new\n```");
-    assert_eq!(styled(&text, "old"), [("-old", colour(RED))]);
-    assert_eq!(styled(&text, "new"), [("+new", colour(GREEN))]);
+    check(&text, "-old", colour(RED));
+    check(&text, "+new", colour(GREEN));
 
     for source in ["```robotlang\nfn \"x\" 42\n```", "```\nfn \"x\" 42\n```", "    fn \"x\" 42"] {
       let text = render(source);
