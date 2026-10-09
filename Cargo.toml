@@ -25,6 +25,10 @@ lto = false
 [dependencies]
 arboard = { version = "3.6.1", default-features = false }
 crossterm = "0.29.0"
+fastrand = "2.5.0"
+mdtext = "0.1.2"
+osc8 = "0.1.0"
 thiserror = "2.0.21"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
+url = "2.5.8"

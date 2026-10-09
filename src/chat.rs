@@ -9,7 +9,9 @@ use crossterm::event::{
   PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::style::{Attribute, SetAttribute};
 use crossterm::terminal::{self, EndSynchronizedUpdate, disable_raw_mode, enable_raw_mode};
+use osc8::Hyperlink;
 
 use crate::agent::{self, Backend, Echo, Phase, Prompt, Usage};
 use crate::input::Input;
@@ -33,7 +35,7 @@ fn restore_modes(out: &mut impl Write, enhanced: bool, disable: impl FnOnce() ->
     let _ = execute!(out, PopKeyboardEnhancementFlags);
   }
   let _ = execute!(out, EndSynchronizedUpdate, DisableBracketedPaste);
-  let _ = write!(out, "\x1b[0m\r\n");
+  let _ = write!(out, "{}{}\r\n", Hyperlink::END, SetAttribute(Attribute::Reset));
   let _ = out.flush();
   let _ = disable();
 }
@@ -1001,7 +1003,7 @@ mod tests {
     live.draw(&mut out, &app.frame(), 80, 24).unwrap();
     let output = String::from_utf8(out).unwrap();
     assert_eq!(app.last_response.as_deref(), Some("first last"));
-    assert!(output.contains(" last") && !output.contains("first"));
+    assert!(output.contains("first last"));
     assert!(output.contains("Error: connection lost"));
     assert!(output.contains("(↑13 ↓2)"));
     assert!(app.request.is_none());

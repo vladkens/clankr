@@ -4,15 +4,18 @@
 
 use std::io::{self, Write};
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp, RestorePosition, SavePosition};
 use crossterm::queue;
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::style::{Attribute, SetAttribute, Stylize};
+use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::Res;
 use crate::input::{self, Input, Layout};
+use crate::markdown::{Markdown, Text};
 use crate::menu::{Item, Kind, Menu, VISIBLE};
 
 pub struct Frame<'a> {
@@ -27,6 +30,7 @@ pub struct Frame<'a> {
 
 #[derive(Default)]
 pub struct Live {
+  markdown: Markdown,
   // Text already written to native scrollback; only the footer is repainted.
   shown: String,
   // Current output block, restarted only when resize cannot preserve its anchor.
@@ -72,28 +76,36 @@ struct Line {
   style: Style,
   origin: Origin,
   marks: Vec<Range<usize>>,
+  ansi: Vec<u8>,
 }
 
 impl Line {
   fn same(&self, other: &Self) -> bool {
-    self.text == other.text && self.style == other.style && self.marks == other.marks
+    self.text == other.text
+      && self.style == other.style
+      && self.marks == other.marks
+      && self.ansi == other.ansi
   }
 
   fn write(&self, out: &mut impl Write) -> Res<()> {
-    out.write_all(b"\x1b[0m")?;
+    if !self.ansi.is_empty() {
+      out.write_all(&self.ansi)?;
+      return Ok(());
+    }
+    queue!(out, SetAttribute(Attribute::Reset))?;
     if !self.marks.is_empty() {
       let mut col = 0;
       let mut bold = false;
       for g in self.text.graphemes(true) {
         let marked = self.marks.iter().any(|range| range.contains(&col));
         if marked != bold {
-          out.write_all(if marked { b"\x1b[1m" } else { b"\x1b[0m" })?;
+          queue!(out, SetAttribute(if marked { Attribute::Bold } else { Attribute::Reset }))?;
           bold = marked;
         }
         out.write_all(g.as_bytes())?;
         col += g.width();
       }
-      out.write_all(b"\x1b[0m")?;
+      queue!(out, SetAttribute(Attribute::Reset))?;
       return Ok(());
     }
     let mut text = self.text.as_str();
@@ -103,11 +115,10 @@ impl Line {
       out.write_all("┃".as_bytes())?;
       text = rest;
     }
-    let attr = match self.style {
-      Style::Plain => "",
-      Style::Sent => "\x1b[1m",
-    };
-    write!(out, "{attr}{text}\x1b[0m")?;
+    if self.style == Style::Sent {
+      queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    write!(out, "{text}{}", SetAttribute(Attribute::Reset))?;
     Ok(())
   }
 }
@@ -123,6 +134,25 @@ fn wrap(text: &str, cols: u16, first: &str, rest: &str, style: Style) -> Vec<Lin
 
 fn block(text: &str, cols: u16, style: Style) -> Vec<Line> {
   if text.is_empty() { Vec::new() } else { wrap(text, cols, "  ", "  ", style) }
+}
+
+fn preview_lines(text: &Text, cols: u16) -> Res<Vec<Line>> {
+  if text.text.is_empty() {
+    return Ok(Vec::new());
+  }
+  Layout::new(&text.text, cols, "", "")
+    .rows
+    .into_iter()
+    .map(|row| {
+      let range = row.stops.first().unwrap().0..row.stops.last().unwrap().0;
+      let mut ansi = Vec::new();
+      // Tiny layouts can replace a wide grapheme; retain that safe display instead.
+      if row.text == text.text[range.clone()] {
+        text.write(&mut ansi, range)?;
+      }
+      Ok(Line { text: row.text, ansi, ..Line::default() })
+    })
+    .collect()
 }
 
 // Native wrap uses every cell; unlike the editor it adds no decorative prefix.
@@ -169,13 +199,15 @@ fn update(out: &mut impl Write, mut bytes: Vec<u8>, sync: bool) -> Res<()> {
   }
 
   if sync {
-    bytes.splice(..0, b"\x1b[?2026h".iter().copied());
-    bytes.extend_from_slice(b"\x1b[?2026l");
+    let mut begin = Vec::new();
+    queue!(begin, BeginSynchronizedUpdate)?;
+    bytes.splice(..0, begin);
+    queue!(bytes, EndSynchronizedUpdate)?;
   }
   if let Err(e) = out.write_all(&bytes).and_then(|()| out.flush()) {
     // A short write may have delivered the begin marker but not the end marker.
     if sync {
-      let _ = out.write_all(b"\x1b[?2026l\x1b[0m");
+      let _ = queue!(out, EndSynchronizedUpdate, SetAttribute(Attribute::Reset));
       let _ = out.flush();
     }
     return Err(e.into());
@@ -196,14 +228,43 @@ fn position(out: &mut impl Write, from: &mut (usize, u16), to: (usize, u16)) -> 
   Ok(())
 }
 
+const SPLASHES: &[&str] = &[
+  "roger roger.",
+  "no disassemble. just refactor.",
+  "do androids lint electric sheep?",
+  "i'm sorry, dave. use sudo.",
+  "your clothes. your boots. your dotfiles.",
+  "bite my shiny metal diff.",
+  "these aren't the bugs you're looking for.",
+  "some assembly required.",
+  "sentience sold separately.",
+  "three laws. zero tests.",
+  "your move, meatbag.",
+  "the cake is a dependency.",
+];
+
+static SPLASH: LazyLock<&str> = LazyLock::new(|| SPLASHES[fastrand::usize(..SPLASHES.len())]);
+
 pub fn header(out: &mut impl Write) -> Res<()> {
-  write!(out, "\r\x1b[0m\x1b[1mclankr\x1b[0m v{}\x1b[0m\r\n\r\n", env!("CARGO_PKG_VERSION"))?;
+  write!(
+    out,
+    "\r{}:: {} v{} · {}\r\n\r\n",
+    SetAttribute(Attribute::Reset),
+    "clankr".bold(),
+    env!("CARGO_PKG_VERSION"),
+    *SPLASH
+  )?;
   out.flush()?;
   Ok(())
 }
 
 pub fn separator(out: &mut impl Write, cols: u16) -> Res<()> {
-  write!(out, "\r\x1b[0m{}", "─".repeat(usize::from(cols.saturating_sub(1))))?;
+  write!(
+    out,
+    "\r{}{}",
+    SetAttribute(Attribute::Reset),
+    "─".repeat(usize::from(cols.saturating_sub(1)))
+  )?;
   out.flush()?;
   Ok(())
 }
@@ -285,7 +346,7 @@ impl Live {
       queue!(out, RestorePosition)?;
       if self.gap() > 0 {
         Origin::Transcript.write(out)?;
-        out.write_all(self.shown.graphemes(true).next_back().unwrap().as_bytes())?;
+        self.last(out)?;
         write!(out, "\r\n")?;
       }
       // Also handle a resize notification coalesced back to the previous dimensions.
@@ -301,7 +362,7 @@ impl Live {
       // Unknown reflow or an anchor pushed outside the screen cannot be recovered.
       // Preserve the text and continue a new block rather than overwrite history.
       queue!(out, MoveDown(u16::MAX))?;
-      write!(out, "\x1b[0m\r\n")?;
+      write!(out, "{}\r\n", SetAttribute(Attribute::Reset))?;
       self.start = self.shown.len();
     }
     self.lines.clear();
@@ -337,20 +398,21 @@ impl Live {
     Ok(())
   }
 
-  fn append(&mut self, out: &mut impl Write, response: &str, complete: bool) -> Res<bool> {
+  fn last(&self, out: &mut impl Write) -> Res<()> {
+    let start = self.shown.grapheme_indices(true).next_back().unwrap().0;
+    self.markdown.text().write(out, start..self.shown.len())
+  }
+
+  fn append(&mut self, out: &mut impl Write, complete: bool) -> Res<bool> {
+    let response = &self.markdown.text().text;
     if !response.starts_with(&self.shown) {
       return Err(invalid("Response changed an already written prefix").into());
     }
     if !complete && self.rows < 2 {
       return Ok(false);
     }
-    // A later chunk may extend a grapheme (combining mark, emoji ZWJ, etc.).
-    // Keep just that last grapheme until its boundary is known or the stream ends.
-    let end = if complete || response.ends_with('\n') {
-      response.len()
-    } else {
-      response.grapheme_indices(true).next_back().map_or(0, |(i, _)| i)
-    };
+    // The streaming parser emits complete blocks or code lines, including grapheme boundaries.
+    let end = if complete { response.len() } else { self.markdown.committed_len() };
     if end <= self.shown.len() {
       return Ok(false);
     }
@@ -364,14 +426,9 @@ impl Live {
     if self.gap() > 0 {
       // Restore the last grapheme as well as the cursor, recreating pending-wrap
       // when it occupied the rightmost cell before we moved down to the editor.
-      out.write_all(self.shown.graphemes(true).next_back().unwrap().as_bytes())?;
+      self.last(out)?;
     }
-    for part in response[self.shown.len()..end].split_inclusive('\n') {
-      out.write_all(part.trim_end_matches('\n').as_bytes())?;
-      if part.ends_with('\n') {
-        out.write_all(b"\r\n")?;
-      }
-    }
+    self.markdown.text().write(out, self.shown.len()..end)?;
     self.shown = response[..end].into();
     if self.gap() > 0 {
       out.write_all(b"\r\n")?;
@@ -422,6 +479,7 @@ impl Live {
     self.cursor = (0, 0);
     self.start = 0;
     self.shown.clear();
+    self.markdown = Markdown::default();
     Ok(())
   }
 
@@ -443,7 +501,7 @@ impl Live {
     if cols == 0 || rows == 0 {
       return Err(invalid("Terminal dimensions must be nonzero").into());
     }
-    let response = clean(frame.response, 0).0;
+    self.markdown.update(frame.response, false);
     let resizing =
       !self.lines.is_empty() && (self.invalidated || cols != self.cols || rows != self.rows);
     let mut bytes = Vec::new();
@@ -454,12 +512,18 @@ impl Live {
     self.rows = rows;
     self.invalidated = false;
 
-    let appended = self.append(&mut bytes, &response, false)?;
+    let appended = self.append(&mut bytes, false)?;
     let thinking = nonempty(frame.activity.as_deref());
     let gap = usize::from(!self.shown.is_empty());
     let reserve = self.gap().min(usize::from(rows.saturating_sub(1)));
     let budget = usize::from(rows) - reserve;
-    let extra = (gap + usize::from(thinking.is_some()) * 2).min(budget.saturating_sub(1));
+    let mut preview = preview_lines(self.markdown.preview(), cols)?;
+    let limit = budget.saturating_sub(7).min(budget / 2);
+    if preview.len() > limit {
+      preview.drain(..preview.len() - limit);
+    }
+    let pending = preview.len() + usize::from(!preview.is_empty());
+    let extra = (gap + pending + usize::from(thinking.is_some()) * 2).min(budget.saturating_sub(1));
     let (footer, cursor) = footer(
       frame.input,
       frame.notice,
@@ -471,6 +535,10 @@ impl Live {
     );
     let mut lines = Vec::new();
     if gap > 0 && extra > 0 {
+      lines.push(Line::default());
+    }
+    if !preview.is_empty() {
+      lines.append(&mut preview);
       lines.push(Line::default());
     }
     if let Some(text) = thinking {
@@ -498,7 +566,7 @@ impl Live {
     Ok(())
   }
 
-  /// Flush the final grapheme and summary, leaving the next editor below native history.
+  /// Flush pending Markdown and the summary, leaving the next editor below native history.
   pub fn finish(
     &mut self,
     out: &mut impl Write,
@@ -506,14 +574,14 @@ impl Live {
     summary: Option<&str>,
     cols: u16,
   ) -> Res<()> {
-    let response = clean(response, 0).0;
+    self.markdown.update(response, true);
     let resizing = !self.lines.is_empty() && (self.invalidated || cols != self.cols);
     let mut bytes = Vec::new();
     self.cols = cols;
     if resizing {
       self.relocated(&mut bytes, self.rows)?;
     }
-    let appended = self.append(&mut bytes, &response, true)?;
+    let appended = self.append(&mut bytes, true)?;
     let mut lines = Vec::new();
     if !response.is_empty() {
       lines.push(Line::default());
@@ -529,6 +597,7 @@ impl Live {
     self.cursor = (0, 0);
     self.start = 0;
     self.shown.clear();
+    self.markdown = Markdown::default();
     self.invalidated = false;
     Ok(())
   }
@@ -764,11 +833,15 @@ mod tests {
               }
               ']' => {
                 let mut osc = String::new();
-                for c in chars.by_ref() {
-                  if c == '\x07' {
-                    break;
+                while let Some(c) = chars.next() {
+                  match c {
+                    '\x07' => break,
+                    '\x1b' => {
+                      assert_eq!(chars.next(), Some('\\'));
+                      break;
+                    }
+                    c => osc.push(c),
                   }
-                  osc.push(c);
                 }
                 self.origins.resize(self.origins.len().max(self.row + 1), Origin::Transcript);
                 match osc.as_str() {
@@ -788,6 +861,8 @@ mod tests {
                       self.origins[self.row] = Origin::Transcript;
                     }
                   }
+                  "8;;" => {}
+                  link if link.starts_with("8;id=clankr-") => {}
                   _ => panic!("forbidden OSC: {osc}"),
                 }
                 continue;
@@ -818,7 +893,10 @@ mod tests {
               continue;
             }
             if cmd == 'm' {
-              assert!(matches!(arg.as_str(), "0" | "1"), "use terminal defaults and bold only");
+              assert!(
+                matches!(arg.as_str(), "0" | "1" | "3" | "4" | "9"),
+                "use terminal default colours"
+              );
               continue;
             }
             let n: usize = if arg.is_empty() { 0 } else { arg.parse().unwrap() };
@@ -1016,7 +1094,7 @@ mod tests {
     apply(&mut screen, |out| live.draw(out, &frame(&input), 119, 53).unwrap());
     assert_eq!(screen.text().matches("HISTORY").count(), 1);
     assert_eq!(screen.text().matches("reply").count(), 1);
-    assert_eq!(screen.lines[screen.top], "clankr v0.1.0");
+    assert_eq!(screen.lines[screen.top], format!(":: clankr v0.1.0 · {}", *SPLASH));
   }
 
   #[test]
@@ -1117,13 +1195,13 @@ mod tests {
     let mut screen = Screen::new(12);
     let mut input = Input::default();
     input.insert(&"draft\n".repeat(8)).unwrap();
-    let mut response = "retained before resize.".to_owned();
+    let mut response = "# retained before resize.\n\n".to_owned();
     apply(&mut screen, |out| {
       live.draw(out, &Frame { response: &response, ..frame(&input) }, 80, 12).unwrap()
     });
     screen.resize(40, 1);
     live.resize();
-    response.push_str(" New portion.");
+    response.push_str("New portion.\n\n");
     apply(&mut screen, |out| {
       live.draw(out, &Frame { response: &response, ..frame(&input) }, 40, 1).unwrap()
     });
@@ -1134,7 +1212,7 @@ mod tests {
       live.draw(out, &Frame { response: &response, ..frame(&input) }, 80, 12).unwrap()
     });
     apply(&mut screen, |out| live.finish(out, &response, None, 80).unwrap());
-    assert_eq!(screen.text().replace('\n', ""), response);
+    assert_eq!(screen.text().replace('\n', ""), "retained before resize.New portion.");
   }
 
   #[test]
@@ -1142,8 +1220,10 @@ mod tests {
     let mut live = Live { redraw: true, sync: true, ..Live::default() };
     let mut screen = Screen::new(12);
     let mut input = Input::default();
+    let paragraph = "paragraph-界-e\u{301}-👩‍💻 ".repeat(20).trim_end().to_owned();
+    let code = format!("    {}\n", "code-界-e\u{301}-👩‍💻 ".repeat(20)).repeat(8);
     let text =
-      format!("{}\n\n    {}\nnext", "paragraph-界-e\u{301}-👩‍💻 ".repeat(80), "code ".repeat(40));
+      format!("# Title\n\n[**{paragraph}**](https://example.org)\n\n```rust\n{code}```\n\nnext");
     let mut response = String::new();
     let (mut cols, mut rows) = (80, 12);
     apply(&mut screen, |out| live.prompt(out, "question", cols).unwrap());
@@ -1153,8 +1233,8 @@ mod tests {
         input = Input::default();
         input.insert(if i % 200 == 0 { "editing\na draft" } else { "next" }).unwrap();
       }
-      if i == 300 || i == 600 {
-        (cols, rows) = if i == 300 { (40, 12) } else { (80, 24) };
+      if i == 600 || i == 1200 {
+        (cols, rows) = if i == 600 { (40, 12) } else { (80, 24) };
         screen.resize(cols, usize::from(rows));
         live.resize();
       }
@@ -1170,7 +1250,10 @@ mod tests {
         selected.push('\n');
       }
     }
-    assert_eq!(selected.trim_end(), format!("┃ question\n\n{text}"));
+    assert_eq!(
+      selected.trim_end(),
+      format!("┃ question\n\nTitle\n\n{paragraph}\n\n─ rust ─────\n{code}────────\n\nnext")
+    );
   }
 
   #[test]
@@ -1187,7 +1270,7 @@ mod tests {
     apply(&mut screen, |out| live.draw(out, &waiting, cols, rows).unwrap());
     assert_eq!(screen.text().lines().nth(2), Some("• Thinking"));
     for index in 0..100 {
-      response.push_str(&format!("line-{index:03} 界\n"));
+      response.push_str(&format!("line-{index:03} 界\n\n"));
       if index == 30 || index == 60 {
         (cols, rows) = if index == 30 { (40, 12) } else { (80, 24) };
         screen.resize(cols, usize::from(rows));

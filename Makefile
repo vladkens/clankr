@@ -1,4 +1,4 @@
-.PHONY: prepare check test build update run
+.PHONY: prepare check test build update clean run
 
 CARGO_FLAGS := --release --locked
 
@@ -21,6 +21,9 @@ build:
 
 update:
 	cargo upgrade -i
+
+clean:
+	cargo clean
 
 run:
 	cargo build -r && clear && ./target/release/clankr

@@ -1,6 +1,7 @@
 mod agent;
 mod chat;
 mod input;
+mod markdown;
 mod menu;
 mod model;
 mod view;

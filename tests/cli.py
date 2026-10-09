@@ -80,7 +80,7 @@ def tokens(text):
             elif final == "u":
                 require(params in (">1", "<1"), f"Unexpected keyboard protocol: {match[0]!r}")
             elif final == "m":
-                require(params in ("0", "1"), f"Use terminal defaults and bold only: {match[0]!r}")
+                require(params in ("0", "1", "3", "4", "9"), f"Use terminal default colours: {match[0]!r}")
             else:
                 require(final in "ABGm" and re.fullmatch(r"[0-9;]*", params),
                         f"Forbidden/unknown CSI (including screen clear): {match[0]!r}")
@@ -89,8 +89,15 @@ def tokens(text):
             continue
         match = OSC.match(text, pos)
         if match:
-            require(match[1] in ("133;A;redraw=1", "133;B", "133;C", "133;P;k=s"),
-                    f"Unexpected OSC: {match[0]!r}")
+            if match[1].startswith("8;"):
+                _, params, uri = match[1].split(";", 2)
+                require((not params and not uri)
+                        or (re.fullmatch(r"id=clankr-\d+-\d+", params)
+                            and re.fullmatch(r"[a-zA-Z][a-zA-Z0-9+.-]*:[\x20-\x7e]+", uri)),
+                        f"Invalid hyperlink: {match[0]!r}")
+            else:
+                require(match[1] in ("133;A;redraw=1", "133;B", "133;C", "133;P;k=s"),
+                        f"Unexpected OSC: {match[0]!r}")
             yield "osc", match[0]
             pos = match.end()
             continue
@@ -106,8 +113,12 @@ def plain(text):
 
 def audit(text):
     controls = list(tokens(text))
-    paste, sync, keyboard = False, False, False
+    paste, sync, keyboard, link = False, False, False, False
     for kind, value in controls:
+        if kind == "osc" and value.startswith(ESC + "]8;"):
+            link = bool(OSC.fullmatch(value)[1].split(";", 2)[2])
+        if kind == "escape" or (kind == "csi" and value[-1] in "ABGKhlu"):
+            require(not link, "Hyperlink leaked into UI cursor/mode changes")
         if kind != "csi":
             continue
         if value == ESC + "[>1u":
@@ -126,7 +137,7 @@ def audit(text):
             sync = True
         elif value == ESC + "[?2026l":
             sync = False
-    require(not paste and not sync and not keyboard, "Terminal modes left enabled")
+    require(not paste and not sync and not keyboard and not link, "Terminal modes left enabled")
     return {"bytes": len(text.encode()), "line_erases": text.count(ESC + "[K"),
             "sync_updates": text.count(ESC + "[?2026h"),
             "keyboard_pushes": text.count(ESC + "[>1u"),
@@ -218,12 +229,13 @@ class Terminal:
         attrs = termios.tcgetattr(self.slave)
         require(not attrs[3] & (termios.ICANON | termios.ECHO), "Raw mode missing")
         require(ESC + "[>1u" in self.output, "Enhanced keys not enabled")
-        require(self.screen.display[0].startswith("clankr v"), "Missing compact header")
+        self.header = self.screen.display[0].rstrip()
+        require(self.header.startswith(":: clankr v"), "Missing compact header")
         require(self.screen.display[2].rstrip() == "┃", "Wrong initial input position")
         require(not self.screen.display[3].strip()
                 and self.screen.display[4].startswith("auto · echo · medium ·"),
                 "Status must sit one blank row below the editor")
-        require(self.screen.buffer[0][0].bold, "Header name must be bold")
+        require(self.screen.buffer[0][3].bold, "Header name must be bold")
         for row, col in ((0, 0), (0, 7), (2, 0), (4, 0)):
             cell = self.screen.buffer[row][col]
             require(cell.fg == "default" and cell.bg == "default", "Use terminal default colours")
@@ -251,7 +263,7 @@ class Terminal:
             return (match and ESC + "[0mauto · " + model in self.output[start + match.end():]
                     and self.screen.display[self.screen.cursor.y].strip() == "┃")
 
-        self.until(completed, f"echo of {expected!r}")
+        self.until(completed, f"echo of {expected!r}", timeout=max(8, len(expected) / 160 + 3))
         summary = SUMMARY.search(self.output[start:])[1]
         rows = self.transcript.splitlines()
         end = max(i for i, row in enumerate(rows) if row == "  " + summary) - 1
@@ -490,7 +502,7 @@ def menus(binary):
         terminal.until(lambda: "Commands" not in terminal.display and "┃ /clear" in terminal.display,
                        "Right completes the command without running it")
         terminal.send("\r")
-        terminal.until(lambda: terminal.screen.display[0].startswith("clankr v")
+        terminal.until(lambda: terminal.screen.display[0].rstrip() == terminal.header
                        and terminal.screen.display[2].rstrip() == "┃", "clear command")
 
         terminal.send("huj! $age")
@@ -542,7 +554,7 @@ def menus(binary):
         terminal.paste("HISTORY-SEED")
         terminal.submit("HISTORY-SEED")
         terminal.send("/cl\r")
-        terminal.until(lambda: terminal.screen.display[0].startswith("clankr v")
+        terminal.until(lambda: terminal.screen.display[0].rstrip() == terminal.header
                        and terminal.screen.display[2].rstrip() == "┃"
                        and "HISTORY-SEED" not in terminal.display, "fresh screen")
         require(terminal.transcript.count("HISTORY-SEED") == 2, "Clear destroyed native scrollback")
@@ -569,7 +581,7 @@ def menus(binary):
         terminal.until(lambda: "Skills 8" not in terminal.display, "close picker while active")
         require("Thinking" in terminal.display, "Esc closed the request instead of the picker")
         terminal.send("\x15/cl\r")
-        terminal.until(lambda: terminal.screen.display[0].startswith("clankr v")
+        terminal.until(lambda: terminal.screen.display[0].rstrip() == terminal.header
                        and terminal.screen.display[2].rstrip() == "┃"
                        and "Thinking" not in terminal.display, "clear while active")
         terminal.paste("new conversation")
@@ -579,7 +591,7 @@ def menus(binary):
         terminal.until(lambda: "press ctrl+c again to exit" in terminal.display,
                        "Existing session asks for exit confirmation")
         terminal.send("/clear\r")
-        terminal.until(lambda: terminal.screen.display[0].startswith("clankr v")
+        terminal.until(lambda: terminal.screen.display[0].rstrip() == terminal.header
                        and terminal.screen.display[2].rstrip() == "┃"
                        and "/272k" not in terminal.display, "clear before exit")
         start = len(terminal.output)
@@ -589,6 +601,71 @@ def menus(binary):
     finally:
         terminal.close()
     print("PASS menus: separate slash/dollar pickers, filtering, scroll, completion, atomic skill deletion, literal paste, resize, clear, active Ctrl+C, session exit")
+
+
+def markdown(binary):
+    terminal = Terminal(binary)
+    source = ("Streaming preview " + "draft remains editable. " * 20 + "PREVIEW-END\n\n"
+              "# Heading\n\n**bold** and *italic*, ~~old~~ and `code`.\n\n"
+              "- first\n  - nested\n- [x] done\n\n"
+              "[site](https://example.org) [src/main.rs](/Users/user/Code/clankr/src/main.rs)\n\n"
+              "```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n"
+              "| name | value |\n| --- | ---: |\n| Makefile | 42 |\n| 界 | 1234 |\n\n"
+              "Final paragraph.")
+    try:
+        terminal.ready()
+        terminal.paste(source)
+        start = len(terminal.output)
+        terminal.send("\r")
+        terminal.until(lambda: "Thinking" in terminal.display, "markdown request")
+        terminal.paste("next draft")
+        terminal.until(lambda: any(row.startswith("Streaming preview")
+                                  for row in terminal.screen.display), "unfinished paragraph preview")
+        require(not any("PREVIEW-END" in row for row in terminal.screen.display
+                        if not row.startswith("┃")), "Paragraph appeared only after its end arrived")
+        require("┃ next draft" in terminal.display, "Preview hid the next draft")
+        terminal.until(lambda: "Generating" in terminal.display
+                       and any(row.rstrip() == "Heading" for row in terminal.screen.display),
+                       "heading during streaming")
+        require(not SUMMARY.search(terminal.output[start:]), "Markdown appeared only after completion")
+        terminal.until(lambda: SUMMARY.search(terminal.output[start:])
+                       and "┃ next draft" in terminal.display, "formatted response and next draft",
+                       timeout=15)
+        rows = terminal.screen.display
+        heading = next(i for i, row in enumerate(rows) if row.rstrip() == "Heading")
+        require(terminal.screen.buffer[heading][0].bold, "Heading is not bold")
+        inline = next(i for i, row in enumerate(rows)
+                      if row.rstrip() == "bold and italic, old and code.")
+        for word, attr in (("bold", "bold"), ("italic", "italics"), ("old", "strikethrough")):
+            col = re.search(rf"\b{word}\b", rows[inline]).start()
+            require(getattr(terminal.screen.buffer[inline][col], attr), f"Missing {word} style")
+        for text in ("- first", "  - nested", "- [x] done", "site src/main.rs",
+                     "─ rust ─────", '    println!("hello");', "name     │ value",
+                     "─────────┼──────", "Makefile │    42", "界       │  1234"):
+            require(text in terminal.transcript, f"Missing Markdown output: {text}")
+        require(not terminal.screen.buffer[inline][rows[inline].index("code")].underscore,
+                "Inline code is underlined")
+        linked = next(i for i, row in enumerate(rows) if row.rstrip() == "site src/main.rs")
+        for label in ("site", "src/main.rs"):
+            col = rows[linked].index(label)
+            require(all(terminal.screen.buffer[linked][i].underscore
+                        for i in range(col, col + len(label))), f"Link is not underlined: {label}")
+        require(not terminal.screen.buffer[linked][4].underscore,
+                "Link underline leaked into surrounding text")
+        for uri in ("https://example.org/", "file:///Users/user/Code/clankr/src/main.rs"):
+            require(any(match[1].startswith("8;id=clankr-") and match[1].endswith(";" + uri)
+                        for match in OSC.finditer(terminal.output[start:])), f"Missing hyperlink: {uri}")
+        require("(https://example.org)" not in terminal.display.split("site src/main.rs", 1)[1],
+                "Hyperlink destination duplicated after its label")
+        draft = terminal.screen.cursor.y
+        require(not terminal.screen.buffer[draft][2].bold
+                and not terminal.screen.buffer[draft][2].underscore, "Markdown style leaked into input")
+        terminal.send("\x03")
+        terminal.until(lambda: "press ctrl+c again to exit" in terminal.display, "exit hint")
+        terminal.exit("\x03")
+    finally:
+        terminal.close()
+    print("PASS markdown: streamed heading, nested styles/lists, links, code indentation, table, draft, default colours and terminal cleanup")
 
 
 def models(binary):
@@ -682,9 +759,9 @@ def models(binary):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
-    parser.add_argument("--case", choices=["tui", "menus", "models"], required=True)
+    parser.add_argument("--case", choices=["tui", "menus", "models", "markdown"], required=True)
     args = parser.parse_args()
-    {"tui": tui, "menus": menus, "models": models}[args.case](args.bin.resolve(strict=True))
+    {"tui": tui, "menus": menus, "models": models, "markdown": markdown}[args.case](args.bin.resolve(strict=True))
 
 
 if __name__ == "__main__":

@@ -2,11 +2,11 @@
 
 ## Goal and current state
 
-First version: a normal `clankr` launch opens a working TUI. The user edits a multiline message, submits it, and receives the same text back. This echo response temporarily stands in for the agent in the main application. The interface already accepts backend events and supports waiting, streaming responses, completion, errors, and cancellation; connecting a real API remains a separate task. There are no separate demo commands, modes, or artificial delays.
+Current stage: TUI with mocks. A normal `clankr` launch opens the editor; a submitted message returns as a streaming echo response with Markdown. The interface supports waiting, generation, counters, completion, errors, and cancellation. The mock deliberately emits small chunks with delays to exercise the interface; a real API remains a separate task. There are no separate demo commands.
 
-The foundation is ready: the root commit `initialize rust project with build tools and agent instructions` contains an empty Rust executable, Cargo, Makefile, rustfmt, `readme.md`, and `agents.md`. The source for selective migration is the local `old` branch at `f503db8`. Extract only the parts needed, not entire interconnected monolithic modules. Parts of `old:readme.md` lag behind the code; check Cmd+Backspace behavior against the latest fix in `old:src/input.rs` and its regression tests.
+Foundation: `cbeef65 initialize project` contains an empty Rust executable, Cargo, Makefile, rustfmt, `readme.md`, and `agents.md`. The source for selective migration is the local `old` branch at `f503db8`. Extract only the parts needed, not entire interconnected monolithic modules. Parts of `old:readme.md` lag behind the code; check Cmd+Backspace behavior against the latest fix in `old:src/input.rs` and its regression tests.
 
-The first feature commit is currently defined. After checking this version, choose the next step based on the result: API integration or a specific TUI improvement. The task cards below retain possible features to migrate and their technical dependencies; they do not prescribe a mandatory sequence or start automatically after the first commit.
+Completed: editor and echo (`ce8dcdc`), command/skill menus and model settings (`86b081e`), native response wrapping and Ctrl+C behavior (`5909c41`), and streaming Markdown. The next recommended task is fixing mouse copying of submitted user messages. Other task cards remain candidates and do not start automatically.
 
 ## How to structure commits
 
@@ -23,7 +23,7 @@ The first feature commit is currently defined. After checking this version, choo
 
 ## First feature commit: working TUI with editing and echo responses
 
-Commit: `add a terminal chat with multiline editing and echo replies`. Depends on: the completed scaffold.
+Commit: `ce8dcdc add terminal chat with multiline editing and mock replies`. Depends on: the completed scaffold.
 
 Sources: `Keyboard`, cleanup, and the necessary dispatch from `old:src/chat.rs`; `Input`, shared `Layout`, word navigation, and regression tests from `old:src/input.rs`; prompt, append-only transcript, and resize from `old:src/view.rs`; minimal PTY lifecycle from `old:tests/cli.py`. Paths: `src/main.rs`, `src/chat.rs`, `src/input.rs`, `src/view.rs`, `tests/cli.py`, Cargo files, and `readme.md`.
 
@@ -35,7 +35,7 @@ Sources: `Keyboard`, cleanup, and the necessary dispatch from `old:src/chat.rs`;
 - [x] Enter leaves the message in the conversation and adds a response with the same text, including newlines; the roles are visually distinct. The field clears so another message can be sent. Enter on empty input sends nothing. The response uses the submitted text snapshot, not the next draft. The terminal must not execute control sequences from the text.
 - [x] Echo is implemented separately in `src/agent.rs` through a nonblocking `Backend` contract: submit a prompt snapshot, receive `Text`/`Finished` events, and cancel. The renderer displays the prompt and an arbitrary response separately. The next draft remains editable while waiting or streaming; pressing Enter again does not start a second request, and Esc cancels the current one. Errors preserve text already received, including the last chunk before `Finished`; cancellation and errors preserve the next draft. Responses are limited to 16 MiB, and events are processed in bounded batches. The backend owns its work and must stop it when dropped; the current echo creates no background tasks.
 - [x] The conversation stays on the terminal's main screen with native scrollback and normal mouse selection. Previous messages survive later submissions; resizing preserves text and cursor position without duplicating completed history. Input and rendering have one owner, with no alternate screen or mouse capture.
-- [x] Ctrl+C exits the application; Ctrl+D exits when input is empty. Restore available terminal modes on normal exit, handled errors, and through the panic hook. Do not promise cleanup after SIGKILL.
+- [x] During a request, Ctrl+C cancels it and preserves the next draft. When idle, it first clears a nonempty draft and shows a hint to press again; an empty new session closes immediately, while an existing session requires a second Ctrl+C. Ctrl+D exits when input is empty. Restore available terminal modes on normal exit, handled errors, and through the panic hook. Do not promise cleanup after SIGKILL.
 
 Validation: `make check`, `make test`, `make build`. In this commit, migrate focused editor regression tests, submitted-snapshot/echo checks, and rendering/resize checks; selecting zero tests does not count as validation. A minimal `tests/cli.py` runs the normal compiled `clankr` in a PTY, isolates HOME/cwd/CLANKR_HOME and credential environment variables, waits for observable states, and checks terminal restoration. Runner interface: `uv run --no-project --with pyte==0.8.2 python tests/cli.py --bin target/release/clankr --case tui`. These are test runner arguments, not new application flags.
 
@@ -43,15 +43,51 @@ Acceptance: open `./target/release/clankr`, type a multiline Unicode message, ed
 
 Implementation result: `make check`, `make test` (21 tests), `make build`, and the `tui` PTY scenario passed. The final waiting-line alignment fix was verified by rerunning five renderer tests, `make check`, the build, and the PTY. The PTY ran through `uv run --offline --no-project --with pyte==0.8.2 python tests/cli.py --bin target/release/clankr --case tui`, using the shared cache. It checks the normal echo CLI, layout, and default terminal colors. Rust tests of the production App with a controlled backend cover waiting, streaming, errors, and cancellation; a terminal model checks long streams and resizing. Dependencies were added through `cargo add`; errors use `thiserror`, and `anyhow` was removed through `cargo rm`. Native keys, Ghostty reflow, and mouse selection remain manual checks. On unknown terminal versions, resizing may leave an old draft on screen; completed history is neither cleared nor reprinted.
 
-## What to choose after the first version
+## Completed: menus and streaming Markdown
 
-If editing and rendering are already comfortable, the next standalone result is a real API response in the same TUI. If the first version exposes interaction problems, first fix the specific defect or add the needed interface capability. Do not invent an intermediate feature just to create another commit.
+- [x] `/` opens commands, and `$` opens a separate skill list. Filtering, cyclic navigation, Right/Tab completion, and Esc dismissal are available. `/clear`, `/quit`, `/copy`, `/fast`, `/model`, and `/effort` work in the normal TUI; `/help` is not needed. Skill and model lists are still mocks.
+- [x] Model selection preserves compatible effort or uses the model's default otherwise. Effort is selected separately through the menu or Ctrl+, / Ctrl+.; fast mode changes independently. The active request retains its settings while the next draft is edited.
+- [x] Markdown renders headings, nested formatting, lists, block quotes, aligned tables, and code blocks. Links are underlined and clickable, without repeating the URL next to the label; inline code is not underlined. `/copy` uses the original response.
+- [x] After waiting, echo emits up to 16 graphemes every 50 ms. An unfinished block appears in an editable preview; a completed block enters history with native wrapping. The draft remains available. Terminal colors are preserved; the startup line chooses one robot splash per launch.
+- [x] One manual example, `mocks/markdown.md`, and `mocks/robot.svg` replace the numbered examples. Code has no syntax highlighting yet, formulas remain text, and images are represented by alt text/links.
+
+Current Markdown validation: `make check test build` (50 Rust tests), PTY `tui`, `menus`, `markdown`, and the complete manual fixture through the PTY passed. The Ghostty 1.3.1 engine was checked separately: character-by-character streaming, width changes, and selection preserve the response's original newlines without duplication. This does not verify physical keys or the GUI clipboard in all terminals.
+
+## Next task: clean copying of user messages
+
+Commit: `preserve native wrapping in submitted user messages`. Paths: `src/view.rs`, `tests/cli.py`, focused renderer regression tests. The current `Live::prompt` wraps lines manually and prints `┃ ` before each one; selection includes both prefixes and extra newlines.
+
+Verified in the Ghostty 1.3.1 engine: ordinary borders, OSC 133 prompt markers, DECSCA, and left margins do not exclude `┃` from selection. Bold and inverse text without added characters copies continuously, including after resizing. The [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout) allows a separate image layer; using it for a border would require independent support and reflow checks and is not considered a ready solution.
+
+- [ ] Render submitted text with native wrapping, preserving only the user's original newlines and indentation. Remove repeated `┃ ` prefixes from history; do not parse user text as Markdown.
+- [ ] Proposed interface: short `:: you` and `:: clankr` labels on separate lines, with the message body starting in the first column; user text stays bold, and responses use Markdown. Labels sit outside paragraphs so the body can be selected without them. Keep default colors; the editor and its `┃` remain a separate mutable region. The user has not yet accepted the final design.
+- [ ] Check the user's long example, multiple paragraphs, original indentation, Unicode, blank lines, narrow windows, and resizing. Completed history is not redrawn, and mouse input is not captured.
+- [ ] Validation: `make check test build`, PTY `tui`, `markdown`; a focused test selecting a long user message before/after resizing, then mouse selection in Ghostty. Check that the summary, next draft, and cancellation stay in place. The fix and its tests belong in one commit.
+
+## How to choose subsequent tasks
+
+After fixing copying, the proposed next step is code highlighting, followed by the next needed TUI capability or API integration. Formulas are deferred until a suitable renderer is available. Do not invent an intermediate feature just to create another commit.
 
 The candidates are listed below. Before implementing a selected task card, refine its scope against the working application. A dependency means required behavior, not a mandatory commit number. For current changes, run `make check`, focused tests, `make build`, and the feature scenario; the full `make test` is needed when shared contracts change.
 
 Task scenarios are covered jointly by Rust tests and the PTY. After API integration, offline tests inject a fake transport directly into the production App and use temporary Session instances and a loopback HTTP/SSE server. This is internal test organization, without demo commands or hidden substitution of the normal application. The normal CLI's PTY still checks input and available actions without a live request; Rust integration tests cover dynamic responses, wire format, save/reload, and failures. If a new UI feature needs a PTY with controlled events, define how to launch a separate test harness in its task card before implementation, without adding a mode to the shipped CLI. The PTY scenario names below are proposed checks to refine when selecting a task card; they are not presented as existing commands.
 
 ## Candidates: TUI improvements
+
+### Markdown code highlighting
+
+Commit: `highlight streamed markdown code blocks`. Paths: `src/markdown.rs`, `src/view.rs`, Cargo files, `tests/cli.py`, `mocks/markdown.md`. Requires completed streaming Markdown; no API is needed.
+
+- [ ] Use an existing Rust highlighting library that preserves state between lines; add the current dependency through `cargo add`. Check Rust, Python, TypeScript, Bash, JSON, and SQL from the shared example; leave unknown/unspecified languages as plain text.
+- [ ] Preserve code text and indentation, native wrapping, and the original `/copy` output. Highlight incoming lines, including multiline comments and strings; preview must not change completed history. Restrict color styling to code, using the terminal palette without changing the overall background or other elements.
+- [ ] Check that final text and styling match for complete and chunked input, unclosed code fences, cancellation, resizing, and color resets before the next paragraph/editor. Update PTY ANSI checks only for allowed colors. Validation: `make check test build` and PTY `markdown`.
+
+### Readable Markdown formulas
+
+- [ ] Integrate text-based LaTeX rendering: single-line formulas within paragraphs, and fractions, roots, matrices, and `aligned` in separate blocks. Preserve normal scrolling, mouse selection, and original Markdown for `/copy`; leave unsupported formulas as source text without losing any parts.
+- [ ] `mdtext 0.1.2` already recognizes formulas through `Options::MATH`, but this mode is currently disabled in clankr. The library emits LaTeX events; rendering belongs to the client, so a terminal-rendering PR to `mdtext` is not needed. During streaming, collect the entire block formula before final rendering.
+- [ ] Choose and verify a renderer. A trial of [term-maths 1.0.0](https://docs.rs/term-maths/1.0.0/term_maths/) on 2026-10-09 showed that simple powers and fractions work, but `aligned` from `mocks/markdown.md` is truncated to `\begin{aligned} A`, and `\sqrt[3]{x}` becomes a square root with brackets. Upstream fixes or another renderer are needed; do not silently integrate it. `tui-math 0.1.1` is also not directly suitable: its required `ratatui 0.29` needs `unicode-width =0.2.0`, conflicting with the existing `unicode-width ^0.2.2`.
+- [ ] Check `mocks/markdown.md`, stream splits within formulas, cancellation, ordinary `$5`/`$10`, unknown commands, long formulas, narrow windows/resizing. Formula styling must not leak into the next paragraph or input field.
 
 ### Submitted prompt history with draft restoration
 
@@ -61,15 +97,6 @@ Sources: `old:src/input.rs` (`History`) and the corresponding `App::edit` in `ol
 
 - [ ] At document boundaries, Up/Down select submitted prompts; moving forward past the last entry restores the current draft's exact text and cursor offset. Editing a recalled prompt must not corrupt the saved new draft.
 - [ ] Validation: `cargo test --release --locked --bin clankr input::tests`, PTY `history`: submit two multiline prompts, start a third, navigate backward/forward, and compare the restored text and cursor.
-
-### Available slash command menu
-
-Commit: `add a searchable slash command menu`. Requires: the first TUI version.
-
-Sources: the simple list from `old:src/menu.rs` and command dispatch from `old:src/chat.rs`; do not migrate future tool-detail panels. Paths: `src/menu.rs`, `src/chat.rs`, `src/view.rs`.
-
-- [ ] `/` opens a filterable list of the actually available `/help` and `/quit`; Enter/Tab selects, Esc closes, and the draft is preserved. Once a streaming API exists, the menu remains available during a response. Paths, multiline/code text, and escaped slashes do not become commands. Add `/model`, `/tools`, and `/attach` only with their respective features.
-- [ ] Validation: `cargo test --release --locked --bin clankr menu::tests`, PTY `commands`: filtering, no results, selection without prompt submission, resizing, and Esc; add the streaming scenario with the streaming API.
 
 ### Resume conversations after restart
 
@@ -106,13 +133,13 @@ Sources: Claude credentials, text wire format, and indexed SSE from `old:src/pro
 - [ ] `--model claude` and explicit `provider/id` select another provider; previously saved text conversations actually appear in its request body. Do not migrate tool/image/effort fields that are not yet needed. Authentication remains read-only.
 - [ ] Validation: `cargo test --release --locked --lib providers::tests` and `cargo test --release --locked --bin clankr chat::tests`: saved Codex turn → Claude fixture → continuation after reload; Claude usage, indexed chunks, error/EOF, and redaction. PTY `provider-switch` checks model selection through the CLI and rendering of saved history without a live request. Do not infer live model availability from a fixture.
 
-### Model selection within a conversation
+### Connect real models to the existing menu
 
-Commit: `add an in-chat model picker`. Requires: support for two providers and conversation persistence.
+Commit: `connect the model picker to real providers`. Requires: providers and conversation persistence. The `/model` menu itself already works with mocks.
 
 Sources: local catalog/manual selection from `old:src/models.rs`, model picker and deferred save from `old:src/chat.rs`. Paths: `src/models.rs`, `src/lib.rs`, `src/chat.rs`, `src/view.rs`.
 
-- [ ] Ctrl+P and `/model` open a search over defaults/history and allow explicit ID entry; Tab switches between the two most recent models. The next model does not change the running request; selection is saved after success, error, and cancellation. Do not present a local list as an API catalog of available models.
+- [ ] Connect real models to the existing `/model`, preserving independent effort/fast selection and the active request's captured settings. Save selection after success, error, and cancellation; define manual ID support and selection history during implementation. Do not present a local list as an API catalog of available models.
 - [ ] Validation: `cargo test --release --locked models::tests`, PTY `models`: selection during a response, draft preservation, cancellation and reload with the new selection, manual IDs, and invalid IDs.
 
 ### Working effort settings
@@ -121,7 +148,7 @@ Commit: `add supported model effort controls`. Requires: model selection within 
 
 Sources: `Options`, `Selection`, and exact-model capabilities from `old:src/models.rs`, option serialization from `old:src/providers.rs`. Paths: `src/models.rs`, `src/providers.rs`, `src/chat.rs`, `src/lib.rs`.
 
-- [ ] Ctrl+O selects an actually supported effort and sends it in the request; custom models do not inherit other models' capabilities. The choice for the next turn is saved without changing the active turn. Check current models and fields against the primary specification during implementation; do not treat the list in `old` as permanently correct.
+- [ ] Connect the existing `/effort` menu and Ctrl+, / Ctrl+. shortcuts to values actually supported by the provider and request serialization; custom models do not inherit other models' capabilities. The choice for the next turn is saved without changing the active turn. Check current models and fields against the primary specification during implementation; do not treat the list in `old` as permanently correct.
 - [ ] Validation: `cargo test --release --locked models::tests`, `cargo test --release --locked --lib providers::tests`, PTY `effort`: exact wire format, unsupported/custom IDs, changes during a response, cancel/error, and restart.
 
 ### One-shot Codex requests through `ask`
@@ -146,13 +173,13 @@ Sources: `Catalog::discover/prepare`, token parser, and snapshots from `old:src/
 - [ ] Support symlink roots, project priority, ambiguity, YAML descriptions, per-file/total 1 MiB limits, and literal/code/escaped dollar signs. Errors in a selected skill preserve the draft. At this stage, resource paths are passed as context; resource reading arrives with `read_file`.
 - [ ] Validation: `cargo test --release --locked --lib skills::tests`, `cargo test --release --locked --lib providers::tests`, PTY `skills`: artificial roots, both providers' wire formats, source rename/deletion, save/reload; unchanged stateless `ask` behavior if that command has been added.
 
-### Skill selection through the `$` menu
+### Connect real skills to the `$` menu
 
-Commit: `add a searchable skill picker`. Requires: skill inclusion by name.
+Commit: `connect the skill picker to discovered skills`. Requires: skill inclusion by name. The `$` menu, filtering, completion, and selected-token deletion already work with mocks.
 
 Sources: mentions/pins from `old:src/skills.rs`, skill picker from `old:src/chat.rs`, and the shared popup. Paths: `src/skills.rs`, `src/chat.rs`, `src/view.rs`.
 
-- [ ] The menu shows each skill's name, description, and source, completes only the current token, and pins the selected identity. Enter does not submit the prompt; deleting the token removes the selection. A changed symlink or missing selected file must not silently switch to another skill.
+- [ ] Replace the mock catalog with real names, descriptions, and sources; connect the selected identity to prepared instructions. Preserve current-token completion without prompt submission and selection removal on deletion. A changed symlink or missing selected file must not silently switch to another skill.
 - [ ] Validation: `cargo test --release --locked --bin clankr chat::tests`, PTY `skill-picker`: collisions between the two roots, pins after Unicode editing/history navigation, selection during streaming, and actual instructions in the next request.
 
 ### The model reads a file through `read_file`
@@ -255,4 +282,4 @@ As related features arrive, check them together: skill → resource read → app
 
 ## Plan status
 
-The first task was implemented on the current branch at the user's explicit instruction, without creating a separate branch. Checks were completed; changes were left for the user's manual review before committing. The Git index was not changed, and no commit was created. Other task cards remain candidates; the next feature has not been selected. Independent review and native acceptance are not claimed as complete.
+The working TUI, menus, native response wrapping, and streaming Markdown are implemented. Continue developing the interface with mocks. The next priority is clean copying of user messages; the fix is not implemented yet, and the proposed design is described above. Code highlighting follows it; APIs, real skills, session persistence, and tools remain separate candidates.

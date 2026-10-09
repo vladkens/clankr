@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::model::Settings;
 use crate::{Error, Res};
 
@@ -115,11 +117,10 @@ impl Echo {
       return Some(Event::Phase(Phase::Generating));
     }
     if reply.sent < reply.prompt.text.len() {
-      let chunk = reply.prompt.text.len().div_ceil(12);
       let end = reply.prompt.text[reply.sent..]
-        .char_indices()
-        .map(|(i, c)| reply.sent + i + c.len_utf8())
-        .find(|&end| end - reply.sent >= chunk)
+        .grapheme_indices(true)
+        .nth(16)
+        .map(|(i, _)| reply.sent + i)
         .unwrap_or(reply.prompt.text.len());
       let text = reply.prompt.text[reply.sent..end].to_owned();
       reply.sent = end;
@@ -179,13 +180,14 @@ mod tests {
       let mut generating = false;
       let mut finished = false;
       let mut usage = None;
-      for ms in (1200..3000).step_by(50) {
+      for ms in (1200..10000).step_by(50) {
         while let Some(event) = echo.poll_at(now + Duration::from_millis(ms)) {
           match event {
             Event::Phase(Phase::Generating) => generating = true,
             Event::Phase(Phase::Thinking) => panic!(),
             Event::Text(text) => {
-              assert!(generating && ms < 2000);
+              assert!(generating);
+              assert!(text.graphemes(true).count() <= 16);
               chunks += 1;
               response.push_str(&text);
             }
@@ -201,7 +203,10 @@ mod tests {
       }
       assert!(finished && generating);
       assert_eq!(response, prompt);
-      assert!(chunks > 0 && (prompt.len() == 1 || chunks > 1));
+      assert!(chunks > 0);
+      if prompt.graphemes(true).count() > 16 {
+        assert!(chunks > 1);
+      }
       let count = prompt.chars().count().div_ceil(4) as u64;
       assert_eq!(usage, Some(Usage { input: count, output: count }));
       assert_eq!(echo.status().context, Some((count * 2, 272_000)));
