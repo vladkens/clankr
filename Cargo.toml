@@ -26,8 +26,9 @@ lto = false
 arboard = { version = "3.6.1", default-features = false }
 crossterm = "0.29.0"
 fastrand = "2.5.0"
-mdtext = "0.1.2"
+mdtext = { git = "https://github.com/kirawi/mdtext", rev = "0c023d6bf27453e772422b4a45b60a34acff0311", version = "0.1.2" }
 osc8 = "0.1.0"
+pulldown-latex = "0.8.0"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy"] }
 thiserror = "2.0.21"
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }

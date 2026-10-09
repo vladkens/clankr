@@ -248,6 +248,7 @@ enum Kind {
   Block,
   Inline,
   Code,
+  Math(String),
   Quote,
   List(Option<u32>),
   // Marker width and whether a blank line separates blocks inside the item.
@@ -419,11 +420,14 @@ impl Render {
     match event {
       Event::Start(tag) => self.open(tag),
       Event::End => self.close(),
-      Event::Text(text)
-      | Event::Html(text)
-      | Event::InlineMath(text)
-      | Event::DisplayMath(text) => {
+      Event::Text(text) | Event::Html(text) => {
         self.push(&text);
+      }
+      Event::InlineMath(text) => self.push(&crate::math::render(&text, false)),
+      Event::DisplayMath(text) => {
+        if let Some(Open { kind: Kind::Math(source), .. }) = self.stack.last_mut() {
+          source.push_str(&text);
+        }
       }
       Event::Code(text) => {
         if self.stack.last().is_some_and(|open| matches!(open.kind, Kind::Code)) {
@@ -484,7 +488,7 @@ impl Render {
           self.push(&" ".repeat(pad - left));
         }
       }
-      if r == 0 {
+      if r == 0 || r + 1 < table.rows.len() {
         self.space(1);
         self.decor(&widths.iter().map(|&width| "─".repeat(width)).collect::<Vec<_>>().join("─┼─"));
       }
@@ -498,7 +502,7 @@ impl Render {
     let style = self.style;
     let link = self.link.clone();
     let kind = match tag {
-      Tag::Paragraph | Tag::HtmlBlock | Tag::DisplayMath | Tag::Heading(_) => {
+      Tag::Paragraph | Tag::HtmlBlock | Tag::Heading(_) => {
         if !self.stack.last().is_some_and(|open| matches!(open.kind, Kind::Item(..))) {
           self.block();
         }
@@ -507,6 +511,10 @@ impl Render {
           self.style = style.with(Style::BOLD).colour(BLUE);
         }
         Kind::Block
+      }
+      Tag::DisplayMath => {
+        self.block();
+        Kind::Math(String::new())
       }
       Tag::CodeBlock(info) => {
         self.block();
@@ -601,6 +609,10 @@ impl Render {
     self.prefixed = self.prefixed.min(self.containers());
     match open.kind {
       Kind::Block | Kind::Quote | Kind::List(_) => self.space(2),
+      Kind::Math(source) => {
+        self.push(&crate::math::render(&source, true));
+        self.space(2);
+      }
       // Tight items are adjacent even though the parser emits paragraph boundaries inside them.
       Kind::Item(_, loose) => {
         self.marker = None;
@@ -640,7 +652,7 @@ pub struct Markdown {
 impl Default for Markdown {
   fn default() -> Self {
     Self {
-      parser: Parser::with_options(Options::GFM | Options::IMMEDIATE_MODE),
+      parser: Parser::with_options(Options::GFM | Options::IMMEDIATE_MODE | Options::MATH),
       read: 0,
       seen: 0,
       render: Render::default(),
@@ -712,7 +724,8 @@ impl Markdown {
       seed: self.render.code.clone().map(|code| (shown.len(), code)),
       ..Render::default()
     };
-    for event in Parser::parse_str(pending, Options::GFM | Options::IMMEDIATE_MODE) {
+    for event in Parser::parse_str(pending, Options::GFM | Options::IMMEDIATE_MODE | Options::MATH)
+    {
       render.event(event);
     }
     if render.text.text.starts_with(shown) {
@@ -950,9 +963,14 @@ mod tests {
       "**unfinished `inline",
       "a\r\nb\r\n\r\nc\n\n&#27;[31m escaped \x1b[2J control",
       "    indented\n\n~~~\ntilde\n~~~",
+      "$E = mc^2$ and $a_i^2$\n\n$$\nx = \\frac{1}{2}\n$$\n\nafter",
+      "\\(\\alpha + \\beta\\)\n\n\\[\\frac{a}{b}\\]\n\n```math\nx^2\n```",
+      "$$\n\\begin{pmatrix}1 & 2 \\\\ 3 & 4\\end{pmatrix}\n$$\n\nafter",
       NESTED,
       WIDE,
       FENCED,
+      "\\(",
+      "\\[",
     ] {
       let expected = render(source);
       let mut markdown = Markdown::default();
@@ -1065,8 +1083,10 @@ mod tests {
     assert_eq!(
       text.text,
       "Before\n\nЯзык     │ Строк кода\n─────────┼───────────\n\
-      Rust     │      3 304\nPython   │        621\nTOML     │         26\n\
-      Makefile │         19\nВсего    │      3 970\n\nAfter"
+      Rust     │      3 304\n─────────┼───────────\n\
+      Python   │        621\n─────────┼───────────\n\
+      TOML     │         26\n─────────┼───────────\n\
+      Makefile │         19\n─────────┼───────────\nВсего    │      3 970\n\nAfter"
     );
     let mut streamed = Markdown::default();
     for (i, c) in source.char_indices() {
@@ -1090,10 +1110,27 @@ mod tests {
     assert_eq!(lines[0], "L  │   C    │    R");
     assert_eq!(lines[1], "───┼────────┼─────");
     assert_eq!(lines[2], "界 │ abcdef │ 1234");
-    assert_eq!(lines[3], "👩‍💻 │   e\u{301}    │    2");
+    assert_eq!(lines[3], lines[1]);
+    assert_eq!(lines[4], "👩‍💻 │   e\u{301}    │    2");
+    assert_eq!(lines[5], lines[1]);
     for line in lines.iter().filter(|line| line.contains('│')) {
       assert_eq!(line.split('│').map(str::width).collect::<Vec<_>>(), [3, 8, 5]);
     }
+  }
+
+  #[test]
+  fn math_formats_formulas_but_leaves_currency_and_code_literal() {
+    assert_eq!(
+      render("$E = mc^2$ and \\(a_i^2\\)\n\n$$\nx = \\frac{1}{2}\n$$\n\nafter").text,
+      "E = mc² and aᵢ²\n\n    1\nx = ─\n    2\n\nafter"
+    );
+    assert_eq!(render("\\[\\frac{a}{b}\\]").text, "a\n─\nb");
+    assert_eq!(render("```math\nx^2\n```").text, "x²");
+    assert_eq!(
+      render("$5 for coffee, $10 for oil and `a_b`.").text,
+      "$5 for coffee, $10 for oil and a_b."
+    );
+    assert_eq!(render("```text\n$x^2$\n```").text, "```text\n$x^2$\n```");
   }
 
   #[test]
