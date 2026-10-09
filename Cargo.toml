@@ -1,0 +1,23 @@
+[package]
+name = "clankr"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal terminal AI client"
+authors = ["vladkens"]
+license = "MIT"
+readme = "readme.md"
+
+[lints.rust]
+non_camel_case_types = "allow"
+unreachable_code = "allow"
+unused_assignments = "allow"
+unused_imports = "deny"
+
+[lints.clippy]
+needless_range_loop = "allow"
+single_match = "allow"
+
+[profile.release]
+panic = "abort"
+strip = false
+lto = false
