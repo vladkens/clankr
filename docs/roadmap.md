@@ -9,7 +9,7 @@ Build the terminal interface first, then bring the existing agent capabilities f
 | [Skills and tools](plans/20261010-agent-tools.md) | An agent that uses explicit skills, works with files, and runs commands with visible results and approvals. | Future |
 | [Image attachments](plans/20261010-images.md) | Images from files or the clipboard reach the model and remain part of the saved conversation. | Future |
 
-The interface comes first. Conversations provide the foundation for tools and image attachments; attachments do not require tools. Within the current interface task, table layout is fixed; submitted prompt history with draft restoration is next.
+The interface comes first. Conversations provide the foundation for tools and image attachments; attachments do not require tools. Table layout, prompt history, and request queuing are implemented. The submitted-message background is ready for manual terminal acceptance before selecting the integration stage.
 
 ## Reference implementation
 

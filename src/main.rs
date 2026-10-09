@@ -6,6 +6,7 @@ mod math;
 mod menu;
 mod model;
 mod syntax;
+mod theme;
 mod view;
 
 type Res<T> = Result<T, Error>;

@@ -18,6 +18,7 @@ use crate::agent::{self, Backend, Echo, Phase, Prompt, Usage};
 use crate::input::{History, Input};
 use crate::menu::{Command, Kind, Menu};
 use crate::model::Settings;
+use crate::theme::{self, Theme};
 use crate::view::{self, Frame, Live};
 use crate::{Error, Res};
 
@@ -27,7 +28,9 @@ static HOOK: Once = Once::new();
 
 fn restore() {
   if ACTIVE.swap(false, Ordering::SeqCst) {
-    restore_modes(&mut io::stdout(), ENHANCED.swap(false, Ordering::SeqCst), disable_raw_mode);
+    let mut out = io::stdout();
+    theme::restore(&mut out);
+    restore_modes(&mut out, ENHANCED.swap(false, Ordering::SeqCst), disable_raw_mode);
   }
 }
 
@@ -537,12 +540,15 @@ pub fn run() -> Res<()> {
   let mut app = App::default();
   let mut clipboard = None;
   let mut live = Live::terminal();
+  let mut theme = Theme::default();
+  let mut input = VecDeque::new();
   view::header(&mut out)?;
   let mut size = (0, 0);
   let result = (|| -> Res<()> {
     let mut dirty = true;
     let mut tick = None;
     loop {
+      input.extend(theme.tick(&mut out)?);
       if app.exit_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         app.exit_deadline = None;
         app.notice = None;
@@ -566,10 +572,14 @@ pub fn run() -> Res<()> {
         live.draw(&mut out, &app.frame(), size.0, size.1)?;
       }
       dirty = false;
-      if !event::poll(Duration::from_millis(25))? {
-        continue;
+      if input.is_empty() {
+        if !event::poll(Duration::from_millis(25))? {
+          continue;
+        }
+        input.extend(theme.filter(event::read()?, &mut out)?);
+        live.background = theme.active();
       }
-      let event = event::read()?;
+      let Some(event) = input.pop_front() else { continue };
       // Read current dimensions even if a resize notification and a key were coalesced.
       let (next_cols, next_rows) = terminal::size()?;
       let next = (next_cols.max(1), next_rows.max(1));

@@ -86,8 +86,8 @@ def tokens(text):
             elif final == "u":
                 require(params in (">1", "<1"), f"Unexpected keyboard protocol: {match[0]!r}")
             elif final == "m":
-                # Markdown uses classic palette foregrounds only: no 256/RGB colours or backgrounds.
-                require(params in ("0", "1", "2", "3", "4", "9", "31", "32", "33", "34", "35", "36"),
+                # Markdown uses ANSI foregrounds; submitted prompts may use palette slot 16.
+                require(params in ("0", "1", "2", "3", "4", "9", "31", "32", "33", "34", "35", "36", "48;5;16"),
                         f"Unexpected text style or colour: {match[0]!r}")
             else:
                 require(final in "ABGm" and re.fullmatch(r"[0-9;]*", params),
@@ -104,7 +104,8 @@ def tokens(text):
                             and re.fullmatch(r"[a-zA-Z][a-zA-Z0-9+.-]*:[\x20-\x7e]+", uri)),
                         f"Invalid hyperlink: {match[0]!r}")
             else:
-                require(match[1] in ("133;A;redraw=1", "133;B", "133;C", "133;P;k=s"),
+                require(match[1] in ("133;A;redraw=1", "133;B", "133;C", "133;P;k=s", "4;16;?", "10;?", "11;?")
+                        or re.fullmatch(r"4;16;rgb:[0-9a-f]{4}/[0-9a-f]{4}/[0-9a-f]{4}", match[1]),
                         f"Unexpected OSC: {match[0]!r}")
             yield "osc", match[0]
             pos = match.end()
@@ -155,7 +156,7 @@ def audit(text):
 
 
 class Terminal:
-    def __init__(self, binary):
+    def __init__(self, binary, colours=None):
         self.temp = tempfile.TemporaryDirectory(prefix="clankr-tui-")
         root = Path(self.temp.name)
         home, cwd, state = (root / name for name in ("home", "workspace", "state"))
@@ -166,6 +167,8 @@ class Terminal:
         self.screen = pyte.HistoryScreen(*self.size, history=10000)
         self.stream = pyte.Stream(self.screen)
         self.output = ""
+        self.colours = colours
+        self.osc_end = 0
         self.decoder = codecs.getincrementaldecoder("utf-8")("strict")
         self.master, self.slave = os.openpty()
         self.before = termios.tcgetattr(self.slave)
@@ -223,6 +226,16 @@ class Terminal:
         # Feed codepoints so pyte's ZWJ limitation does not swallow the remainder.
         for char in text:
             self.stream.feed(char)
+        if self.colours is not None:
+            for match in OSC.finditer(self.output, self.osc_end):
+                self.osc_end = match.end()
+                name, _, value = match[1].rpartition(";")
+                if name not in self.colours:
+                    continue
+                if value == "?":
+                    self.send(ESC + "]" + name + ";" + self.colours[name] + ESC + "\\")
+                else:
+                    self.colours[name] = value
         return True
 
     def until(self, predicate, label, timeout=8):
@@ -886,8 +899,51 @@ def queue(binary):
     print("PASS queue: FIFO replies, pending edit, history, draft cursor, cancellation and resize")
 
 
+def theme(binary):
+    original = "rgb:0101/0202/0303"
+    colours = {"4;16": original, "10": "rgb:c0/c0/c0", "11": "rgb:20/20/20"}
+    terminal = Terminal(binary, colours)
+    try:
+        terminal.ready()
+        terminal.until(lambda: colours["4;16"] == "rgb:3030/3030/3030", "dark prompt colour")
+        # A normal key after the reply confirms that the single input reader consumed it.
+        terminal.send("x")
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "x",
+                       "input following OSC replies")
+        require(terminal.screen.buffer[terminal.screen.cursor.y][0].bg == "default",
+                "Draft background changed")
+        terminal.send("\x15")
+        prompt = "x" * terminal.size[0] + "last column\nnext line"
+        terminal.paste(prompt)
+        terminal.send("\r")
+        terminal.until(lambda: "Thinking" in terminal.display, "coloured submitted prompt")
+        rows = terminal.screen.display
+        row = next(i for i, line in enumerate(rows) if line.rstrip() == "x" * terminal.size[0])
+        require(rows[row + 1].rstrip() == "last column", "Native wrap lost the final column")
+        require(all(terminal.screen.buffer[i][terminal.size[0] - 1].bg != "default"
+                    for i in (row, row + 1, row + 2)), "Background does not fill prompt rows")
+        require(terminal.screen.buffer[terminal.screen.cursor.y][0].bg == "default",
+                "Prompt background leaked into editor")
+        # Change the theme while the first response streams. Only the palette changes.
+        colours.update({"10": "rgb:22/22/22", "11": "rgb:ee/ee/ee"})
+        terminal.until(lambda: colours["4;16"] == "rgb:d9d9/d9d9/d9d9", "light prompt colour")
+        terminal.until(lambda: SUMMARY.search(terminal.output) and "Generating" not in terminal.display,
+                       "completed reply")
+        start = len(terminal.output)
+        colours.update({"10": "rgb:c0/c0/c0", "11": "rgb:20/20/20"})
+        terminal.until(lambda: colours["4;16"] == "rgb:3030/3030/3030", "dark theme restored")
+        require("x" * 20 not in terminal.output[start:], "Theme change redrew completed history")
+        require("rgb:" not in terminal.display, "OSC reply leaked into editor")
+        terminal.exit()
+        require(colours["4;16"] == original, "Original palette entry was not restored")
+    finally:
+        terminal.close()
+    print("PASS theme: history background, default editor, native wrap, theme changes, palette restoration")
+
+
 def main():
-    cases = {"tui": tui, "menus": menus, "models": models, "markdown": markdown, "queue": queue}
+    cases = {"tui": tui, "menus": menus, "models": models, "markdown": markdown, "queue": queue,
+             "theme": theme}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
     parser.add_argument("--case", choices=["all", *cases], default="all")

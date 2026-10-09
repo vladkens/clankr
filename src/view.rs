@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp, RestorePosition, SavePosition};
 use crossterm::queue;
-use crossterm::style::{Attribute, SetAttribute, Stylize};
+use crossterm::style::{Attribute, Color, SetAttribute, SetBackgroundColor, Stylize};
 use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -32,6 +32,7 @@ pub struct Frame<'a> {
 
 #[derive(Default)]
 pub struct Live {
+  pub background: bool,
   markdown: Markdown,
   // Text already written to native scrollback; only the footer is repainted.
   shown: String,
@@ -466,17 +467,33 @@ impl Live {
     }
     header(&mut bytes)?;
     update(out, bytes, self.sync)?;
-    *self = Self { sync: self.sync, redraw: self.redraw, ..Self::default() };
+    *self =
+      Self { sync: self.sync, redraw: self.redraw, background: self.background, ..Self::default() };
     Ok(())
   }
 
-  // Bold marks the user's role without a colour. The terminal wraps it, so a selection copies only
-  // the user's own line breaks; no prefix or frame enters the clipboard.
+  // Native wrapping keeps user text copyable. Erase to the right with the background colour,
+  // rather than adding spaces or drawing a prefix on each visual row.
   pub fn prompt(&mut self, out: &mut impl Write, text: &str) -> Res<()> {
     let mut bytes = Vec::new();
     self.patch(&mut bytes, &[], (0, 0))?;
     queue!(bytes, SetAttribute(Attribute::Reset), SetAttribute(Attribute::Bold))?;
-    write!(bytes, "{}", clean(text, 0).0.replace('\n', "\r\n"))?;
+    if self.background {
+      queue!(bytes, SetBackgroundColor(Color::AnsiValue(crate::theme::SLOT)))?;
+      for (i, line) in clean(text, 0).0.split('\n').enumerate() {
+        if i > 0 {
+          write!(bytes, "\r\n")?;
+        }
+        queue!(bytes, Clear(ClearType::UntilNewLine))?;
+        write!(bytes, "{line}")?;
+        let last = line.graphemes(true).next_back().map_or(0, str::width);
+        if usize::from(edge(line, self.cols)) + last < usize::from(self.cols.max(1)) {
+          queue!(bytes, Clear(ClearType::UntilNewLine))?;
+        }
+      }
+    } else {
+      write!(bytes, "{}", clean(text, 0).0.replace('\n', "\r\n"))?;
+    }
     queue!(bytes, SetAttribute(Attribute::Reset))?;
     write!(bytes, "\r\n\r\n")?;
     update(out, bytes, self.sync)?;
@@ -1257,6 +1274,28 @@ mod tests {
         }
         assert_eq!(selected.trim_end_matches('\n'), text, "width {cols}");
       }
+    }
+  }
+
+  #[test]
+  fn prompt_background_preserves_full_width_characters_and_original_line_breaks() {
+    crossterm::style::force_color_output(true);
+    for text in ["abcd界xy", "12345678\nlast", "界".repeat(13).as_str(), "\nlast\n"] {
+      let mut live = Live { background: true, cols: 8, ..Live::default() };
+      let mut out = Vec::new();
+      live.prompt(&mut out, text).unwrap();
+      let output = String::from_utf8(out).unwrap();
+      assert!(output.contains("\x1b[48;5;16m"));
+      if text == "abcd界xy" {
+        assert_eq!(output.matches("\x1b[K").count(), 1, "do not erase the last column");
+      }
+      let selected = output
+        .replace("\x1b[0m", "")
+        .replace("\x1b[1m", "")
+        .replace("\x1b[48;5;16m", "")
+        .replace("\x1b[K", "");
+      assert_eq!(selected, format!("{}\r\n\r\n", text.replace('\n', "\r\n")));
+      assert!(output.ends_with("\x1b[0m\r\n\r\n"));
     }
   }
 
