@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as Mods};
@@ -316,9 +317,86 @@ impl Input {
   }
 }
 
+#[derive(Default)]
+pub struct History {
+  entries: Vec<Input>,
+  index: Option<usize>,
+  draft: Option<Input>,
+  edits: BTreeMap<usize, Input>,
+}
+
+impl History {
+  pub fn browsing(&self) -> bool {
+    self.index.is_some()
+  }
+
+  pub fn record(&mut self, input: &Input) {
+    self.entries.push(input.clone());
+  }
+
+  pub fn select(&mut self, input: &mut Input, back: bool) {
+    let current = self.index.unwrap_or(self.entries.len());
+    let next = if back { current.saturating_sub(1) } else { current + 1 };
+    if next == current || next > self.entries.len() {
+      return;
+    }
+
+    if let Some(index) = self.index {
+      self.edits.insert(index, input.clone());
+    } else {
+      self.draft = Some(input.clone());
+    }
+    if next == self.entries.len() {
+      *input = self.reset();
+    } else {
+      *input = self.edits.get(&next).unwrap_or(&self.entries[next]).clone();
+      self.index = Some(next);
+    }
+  }
+
+  pub fn reset(&mut self) -> Input {
+    self.index = None;
+    self.edits.clear();
+    self.draft.take().unwrap_or_default()
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn history_keeps_edits_separate_and_restores_the_exact_draft() {
+    let mut history = History::default();
+    let first = input("first\n界 e\u{301}");
+    let mut second = input("second ");
+    second.mention(second.pos..second.pos, "agent-rules").unwrap();
+    history.record(&first);
+    history.record(&second);
+    let mut draft = input("new 👩‍💻\nwrapped draft");
+    edit(&mut draft, KeyCode::Up, 10);
+    let saved = draft.clone();
+    history.select(&mut draft, true);
+    assert_eq!(draft, second);
+    draft.insert("edited").unwrap();
+    let edited = draft.clone();
+    history.select(&mut draft, true);
+    assert_eq!(draft, first);
+    history.select(&mut draft, true);
+    assert_eq!(draft, first);
+    history.select(&mut draft, false);
+    assert_eq!(draft, edited);
+    history.select(&mut draft, false);
+    assert_eq!(draft, saved);
+    assert!(!history.browsing());
+    history.select(&mut draft, false);
+    assert_eq!(draft, saved);
+    history.select(&mut draft, true);
+    assert_eq!(draft, second);
+    history.record(&edited);
+    assert_eq!(history.reset(), saved);
+    assert_eq!(history.entries[1], second);
+  }
 
   #[test]
   fn picked_skills_delete_atomically_and_pasted_names_remain_plain_text() {

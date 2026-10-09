@@ -454,7 +454,6 @@ def mock_lifecycle(binary):
                 and terminal.screen.display[8].startswith("─"), "Draft must remain below activity")
         terminal.until(lambda: terminal.screen.display[4].startswith("  Thinking"), "blinking dot")
         terminal.paste("next draft")
-        terminal.send("\r")
         terminal.until(lambda: "Generating (1s)" in terminal.display, "mock generation")
         terminal.until(lambda: "(↑1 ↓1)" in terminal.display, "live token counter")
         require("next draft" in terminal.display, "Generation swallowed the next draft")
@@ -466,7 +465,7 @@ def mock_lifecycle(binary):
         require("2/272k 0%" in terminal.display, "Context count missing after completion")
         require("Thinking" not in terminal.display and "Generating" not in terminal.display,
                 "Activity should disappear after completion")
-        require(len(SUMMARY.findall(terminal.output[start:])) == 1, "Busy Enter submitted twice")
+        require(len(SUMMARY.findall(terminal.output[start:])) == 1, "Draft was sent without Enter")
 
         terminal.send("\x15")
         for phase in ("Thinking", "Generating"):
@@ -832,8 +831,63 @@ def models(binary):
     print("PASS models: separate model/effort lists, completion, cancel, cyclic navigation, resize, current markers, compatible settings, default fallback, Ctrl+,/Ctrl+., echo, clear")
 
 
+def queue(binary):
+    terminal = Terminal(binary)
+    try:
+        terminal.ready()
+        terminal.send("first\r")
+        terminal.until(lambda: "Thinking" in terminal.display, "active request")
+        for text in ("second\n界 line", "third"):
+            terminal.paste(text)
+            terminal.send("\r")
+        terminal.until(lambda: "Queued: 2" in terminal.display, "two queued requests")
+        require("2. third" in terminal.display, "Missing queue preview")
+        terminal.send(UP)
+        terminal.until(lambda: "Queued: 1" in terminal.display
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "third",
+                       "last queued prompt returned to editor")
+        terminal.send(" edited\r")
+        terminal.until(lambda: "Queued: 2" in terminal.display, "edited prompt queued again")
+        terminal.until(lambda: len(SUMMARY.findall(terminal.output)) == 3
+                       and "Thinking" not in terminal.display, "three sequential replies")
+        text = terminal.transcript
+        for message in ("first", "second\n界 line", "third edited"):
+            require(text.count(message) == 2, f"Lost or duplicate turn: {message}")
+        require(text.index("first") < text.index("second") < text.index("third edited"),
+                "Queue changed request order")
+        require("Queued:" not in terminal.display, "Completed queue stayed visible")
+
+        terminal.send("new draft" + LEFT * 2)
+        terminal.until(lambda: terminal.screen.cursor.x == 7, "draft cursor")
+        terminal.send(UP)
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "third edited",
+                       "history recall")
+        terminal.send(DOWN)
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "new draft"
+                       and terminal.screen.cursor.x == 7, "draft and cursor restoration")
+        terminal.send("\x15cancel me\r")
+        terminal.until(lambda: "Thinking" in terminal.display, "request to cancel")
+        terminal.send("wait for me\r")
+        terminal.until(lambda: "Queued: 1" in terminal.display, "queued before cancel")
+        terminal.send(ESC)
+        terminal.until(lambda: "Queue paused: 1" in terminal.display
+                       and "Thinking" not in terminal.display, "cancellation pauses the queue")
+        for cols, rows in ((40, 12), (119, 53)):
+            terminal.resize(cols, rows)
+        terminal.send(UP)
+        terminal.until(lambda: "Queue paused:" not in terminal.display
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "wait for me",
+                       "paused queue remains editable")
+        terminal.send("\x15/clear\r")
+        terminal.until(lambda: "wait for me" not in terminal.display, "clear queued conversation")
+        terminal.exit("\x03")
+    finally:
+        terminal.close()
+    print("PASS queue: FIFO replies, pending edit, history, draft cursor, cancellation and resize")
+
+
 def main():
-    cases = {"tui": tui, "menus": menus, "models": models, "markdown": markdown}
+    cases = {"tui": tui, "menus": menus, "models": models, "markdown": markdown, "queue": queue}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
     parser.add_argument("--case", choices=["all", *cases], default="all")

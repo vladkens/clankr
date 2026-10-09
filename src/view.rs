@@ -26,6 +26,8 @@ pub struct Frame<'a> {
   pub notice: Option<&'a str>,
   pub menu: Option<&'a Menu>,
   pub messages: &'a [String],
+  pub queued: Vec<&'a str>,
+  pub paused: bool,
 }
 
 #[derive(Default)]
@@ -527,15 +529,7 @@ impl Live {
     }
     let pending = preview.len() + usize::from(!preview.is_empty());
     let extra = (gap + pending + usize::from(thinking.is_some()) * 2).min(budget.saturating_sub(1));
-    let (footer, cursor) = footer(
-      frame.input,
-      frame.notice,
-      &frame.status,
-      frame.menu,
-      frame.messages,
-      cols,
-      budget - extra,
-    );
+    let (footer, cursor) = footer(frame, cols, budget - extra);
     let mut lines = Vec::new();
     if gap > 0 && extra > 0 {
       lines.push(Line::default());
@@ -606,37 +600,46 @@ impl Live {
   }
 }
 
-fn footer(
-  input: &Input,
-  notice: Option<&str>,
-  status: &str,
-  menu: Option<&Menu>,
-  messages: &[String],
-  cols: u16,
-  budget: usize,
-) -> (Vec<Line>, (usize, u16)) {
+fn footer(frame: &Frame<'_>, cols: u16, budget: usize) -> (Vec<Line>, (usize, u16)) {
+  let input = frame.input;
   let layout = Layout::input(&input.text, cols);
   let cursor = layout.cursor(input.pos, input.trailing);
-  let label = notice.unwrap_or(status);
+  let label = frame.notice.unwrap_or(&frame.status);
   let label = clean(label, 0).0;
-  let menu = menu.filter(|_| notice.is_none());
+  let menu = frame.menu.filter(|_| frame.notice.is_none());
   // Rules frame the editor once the input and status fit; the lower one also tops the menu.
   let ruled = budget >= 4;
-  let frame = 2 * usize::from(ruled);
+  let rules = 2 * usize::from(ruled);
   let mut status = if let Some(menu) = menu {
-    menu_lines(menu, cols, budget - 1 - frame)
+    menu_lines(menu, cols, budget - 1 - rules)
   } else {
     let mut status = wrap(&label, cols, "", "", Style::Plain);
     status.truncate(usize::from(budget >= 2));
     status
   };
-  let available = budget - status.len() - frame;
-  let mut lines: Vec<_> =
-    messages.iter().flat_map(|message| meta(&clean(message, 0).0, cols)).collect();
+  let available = budget - status.len() - rules;
   let limit = available.saturating_sub(2);
-  if lines.len() > limit {
-    lines.drain(..lines.len() - limit);
+  let mut queued = Vec::new();
+  if !frame.queued.is_empty() && limit > 0 {
+    let title = if frame.paused { "Queue paused" } else { "Queued" };
+    let resume = if frame.paused { " · enter resume" } else { "" };
+    let width = usize::from(cols.saturating_sub(3));
+    let title = format!("{title}: {}{resume} · ↑ edit last", frame.queued.len());
+    queued.extend(meta(&clip(&title, width), cols));
+    let count = limit.saturating_sub(1).min(3);
+    for (i, text) in frame.queued.iter().enumerate().skip(frame.queued.len().saturating_sub(count))
+    {
+      let text = clean(&clip(text, width), 0).0.replace('\n', " ↵ ");
+      queued.extend(meta(&clip(&format!("{}. {text}", i + 1), width), cols));
+    }
   }
+  let mut lines: Vec<_> =
+    frame.messages.iter().flat_map(|message| meta(&clean(message, 0).0, cols)).collect();
+  let remaining = limit.saturating_sub(queued.len());
+  if lines.len() > remaining {
+    lines.drain(..lines.len() - remaining);
+  }
+  lines.extend(queued);
   if !lines.is_empty() {
     lines.push(Line::default());
   }
@@ -779,6 +782,8 @@ mod tests {
       notice: None,
       menu: None,
       messages: &[],
+      queued: Vec::new(),
+      paused: false,
     }
   }
 
@@ -1172,7 +1177,7 @@ mod tests {
       input.pos = pos;
       for cols in [1, 2, 3, 8, 40, 119] {
         for rows in [1, 2, 3, 12, 53] {
-          let (lines, cursor) = footer(&input, None, "echo", None, &[], cols, rows);
+          let (lines, cursor) = footer(&frame(&input), cols, rows);
           assert!(lines.len() <= rows);
           assert!(cursor.0 < lines.len() && cursor.1 < cols);
           assert!(lines.iter().all(|line| line.text.width() <= usize::from(cols)));
@@ -1185,20 +1190,46 @@ mod tests {
   }
 
   #[test]
+  fn queue_stays_above_the_editor_and_yields_space_in_small_windows() {
+    let mut input = Input::default();
+    input.insert("next draft").unwrap();
+    let messages = ["Copied to clipboard.".into()];
+    let frame = Frame {
+      queued: vec!["one", "two\n界\tthree", "four"],
+      paused: true,
+      messages: &messages,
+      ..frame(&input)
+    };
+    let (lines, cursor) = footer(&frame, 80, 24);
+    let queue = lines.iter().position(|line| line.text.contains("Queue paused: 3")).unwrap();
+    assert!(queue < cursor.0);
+    assert_eq!(lines[queue + 2].text, "  2. two ↵ 界    three");
+    assert_eq!(lines[cursor.0].text, "next draft");
+    for cols in [1, 2, 3, 8, 40, 119] {
+      for rows in 1..16 {
+        let (lines, cursor) = footer(&frame, cols, rows);
+        assert!(lines.len() <= rows);
+        assert!(cursor.0 < lines.len() && cursor.1 < cols);
+        assert!(lines.iter().all(|line| line.text.width() < usize::from(cols.max(2))));
+      }
+    }
+  }
+
+  #[test]
   fn rules_frame_the_editor_and_its_lower_rule_tops_the_menu() {
     let mut input = Input::default();
     input.insert("draft").unwrap();
     let texts = |lines: Vec<Line>| lines.into_iter().map(|line| line.text).collect::<Vec<_>>();
     let rule = "─".repeat(39);
-    let (lines, cursor) = footer(&input, None, "echo", None, &[], 40, 12);
+    let (lines, cursor) = footer(&frame(&input), 40, 12);
     assert_eq!(texts(lines), [&rule, "draft", &rule, "echo"]);
     assert_eq!(cursor, (1, 5));
-    assert_eq!(texts(footer(&input, None, "echo", None, &[], 40, 3).0), ["draft", "echo"]);
+    assert_eq!(texts(footer(&frame(&input), 40, 3).0), ["draft", "echo"]);
 
     input = Input::default();
     input.insert("$").unwrap();
     let menu = Menu::open(&input, crate::model::Settings::default()).unwrap();
-    let lines = texts(footer(&input, None, "echo", Some(&menu), &[], 40, 12).0);
+    let lines = texts(footer(&Frame { menu: Some(&menu), ..frame(&input) }, 40, 12).0);
     assert_eq!(lines[..3], [&rule, "$", &rule]);
     assert!(lines[3].starts_with("Skills 8") && lines[3].ends_with("1–5"));
     assert_eq!(lines.iter().filter(|line| **line == rule).count(), 3);
@@ -1240,7 +1271,7 @@ mod tests {
     assert!(output.contains("\x1b[0m\x1b[2m  Copied to clipboard.\x1b[0m"));
 
     let messages = ["Copied to clipboard.".to_owned()];
-    let (lines, _) = footer(&Input::default(), None, "echo", None, &messages, 40, 12);
+    let (lines, _) = footer(&Frame { messages: &messages, ..frame(&Input::default()) }, 40, 12);
     assert_eq!(lines[0].text, "  Copied to clipboard.");
     assert!(lines[0].style == Style::Faint);
   }

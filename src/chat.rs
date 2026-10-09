@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +15,7 @@ use crossterm::terminal::{self, EndSynchronizedUpdate, disable_raw_mode, enable_
 use osc8::Hyperlink;
 
 use crate::agent::{self, Backend, Echo, Phase, Prompt, Usage};
-use crate::input::Input;
+use crate::input::{History, Input};
 use crate::menu::{Command, Kind, Menu};
 use crate::model::Settings;
 use crate::view::{self, Frame, Live};
@@ -135,8 +136,28 @@ impl Request {
   }
 }
 
+struct Queued {
+  input: Input,
+  settings: Settings,
+}
+
+impl Queued {
+  fn prompt(self) -> Prompt {
+    let mut skills = Vec::new();
+    for skill in self.input.skills {
+      if !skills.contains(&skill.name) {
+        skills.push(skill.name);
+      }
+    }
+    Prompt { text: self.input.text, skills, settings: self.settings }
+  }
+}
+
 struct App {
   input: Input,
+  history: History,
+  queue: VecDeque<Queued>,
+  paused: bool,
   notice: Option<String>,
   backend: Box<dyn Backend>,
   request: Option<Request>,
@@ -159,6 +180,9 @@ impl App {
   fn new(backend: Box<dyn Backend>) -> Self {
     Self {
       input: Input::default(),
+      history: History::default(),
+      queue: VecDeque::new(),
+      paused: false,
       notice: None,
       backend,
       request: None,
@@ -198,6 +222,8 @@ impl App {
       notice: self.notice.as_deref(),
       menu: self.menu.as_ref(),
       messages: &self.messages,
+      queued: self.queue.iter().map(|entry| entry.input.text.as_str()).collect(),
+      paused: self.paused,
     }
   }
 
@@ -212,6 +238,9 @@ impl App {
   fn clear(&mut self, live: &mut Live, out: &mut impl Write, rows: u16) -> Res<()> {
     self.backend.reset();
     self.request = None;
+    self.queue.clear();
+    self.paused = false;
+    self.history.reset();
     self.has_session = false;
     self.last_response = None;
     self.messages.clear();
@@ -229,7 +258,7 @@ impl App {
       Command::Clear => return Ok(Action::Clear),
       Command::Quit => return Ok(Action::Exit),
       Command::Fast => {
-        self.input = Input::default();
+        self.input = self.history.reset();
         if self.settings.model.fast {
           self.settings.fast = !self.settings.fast;
         } else {
@@ -237,16 +266,16 @@ impl App {
         }
       }
       Command::Copy => {
-        self.input = Input::default();
+        self.input = self.history.reset();
         return Ok(Action::Copy);
       }
       Command::Model(Some(model)) => {
         self.settings.select(model);
-        self.input = Input::default();
+        self.input = self.history.reset();
       }
       Command::Effort(Some(effort)) if self.settings.model.efforts.contains(&effort) => {
         self.settings.effort = Some(effort);
-        self.input = Input::default();
+        self.input = self.history.reset();
       }
       Command::Model(_) | Command::Effort(_) => {
         let prefix = if matches!(command, Command::Model(_)) { "/model " } else { "/effort " };
@@ -294,6 +323,7 @@ impl App {
       && request.failure.is_none()
     {
       request.failure = Some(Error::Cancelled);
+      self.paused = true;
       self.backend.cancel();
     }
   }
@@ -325,10 +355,23 @@ impl App {
           if !request.response.is_empty() {
             self.last_response = Some(request.response);
           }
+          if error.is_some() {
+            self.paused = true;
+          }
+          break;
         }
       }
     }
-    Ok(self.flush_messages(live, out, cols)? || changed)
+    changed |= self.flush_messages(live, out, cols)?;
+    if self.request.is_none()
+      && !self.paused
+      && let Some(entry) = self.queue.pop_front()
+    {
+      self.history.record(&entry.input);
+      self.start(entry.prompt(), live, out)?;
+      changed = true;
+    }
+    Ok(changed)
   }
 
   fn stop(&mut self, live: &mut Live, out: &mut impl Write, cols: u16) -> Res<()> {
@@ -360,6 +403,7 @@ impl App {
       }
       if !self.input.text.is_empty() {
         self.input = Input::default();
+        self.history.reset();
         self.notice = Some("press ctrl+c again to exit".into());
         self.exit_deadline = None;
         self.draft_cleared = true;
@@ -430,21 +474,40 @@ impl App {
           if let Some(command) = Command::parse(&self.input.text) {
             return self.command(command);
           }
-          if self.request.is_none() && !self.input.text.trim().is_empty() {
+          if self.request.is_none() {
+            self.paused = false;
+          }
+          if !self.input.text.trim().is_empty() {
             let input = std::mem::take(&mut self.input);
-            let mut skills = Vec::new();
-            for skill in input.skills {
-              if !skills.contains(&skill.name) {
-                skills.push(skill.name);
-              }
-            }
+            self.input = self.history.reset();
+            let entry = Queued { input, settings: self.settings };
             self.menu = None;
-            return Ok(Action::Send(Prompt { text: input.text, skills, settings: self.settings }));
+            if self.request.is_some() || !self.queue.is_empty() {
+              self.queue.push_back(entry);
+            } else {
+              self.history.record(&entry.input);
+              return Ok(Action::Send(entry.prompt()));
+            }
           }
         } else if key.code == KeyCode::Esc && self.request.is_some() {
           return Ok(Action::Cancel);
         } else {
-          self.input.edit(key, cols)?;
+          if key.code == KeyCode::Up
+            && key.modifiers.is_empty()
+            && self.input.text.is_empty()
+            && !self.history.browsing()
+            && let Some(entry) = self.queue.pop_back()
+          {
+            self.input = entry.input;
+            self.settings = entry.settings;
+            return Ok(Action::None);
+          }
+          if !self.input.edit(key, cols)?
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+          {
+            self.history.select(&mut self.input, key.code == KeyCode::Up);
+          }
           if let Some(menu) = &mut self.menu {
             if !menu.refresh(&self.input, self.settings) {
               self.menu = Menu::open(&self.input, self.settings);
@@ -559,6 +622,135 @@ mod tests {
     for c in text.chars() {
       app.event(key(KeyCode::Char(c), Mods::NONE), 80).unwrap();
     }
+  }
+
+  fn submit(app: &mut App, live: &mut Live, out: &mut Vec<u8>) {
+    match app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap() {
+      Action::Send(prompt) => app.start(prompt, live, out).unwrap(),
+      Action::None => {}
+      action => panic!("unexpected {action:?}"),
+    }
+  }
+
+  #[test]
+  fn queued_prompts_keep_order_settings_and_skills_when_the_last_is_edited() {
+    let peer = Rc::new(RefCell::new(Peer::default()));
+    let mut app = App::new(Box::new(Script(peer.clone())));
+    let (mut live, mut out) = (Live::default(), Vec::new());
+    type_text(&mut app, "first");
+    submit(&mut app, &mut live, &mut out);
+    type_text(&mut app, "second");
+    submit(&mut app, &mut live, &mut out);
+    app.settings.select(crate::model::Model::find("sonnet").unwrap());
+    let settings = app.settings;
+    app.input.insert("third ").unwrap();
+    app.input.mention(app.input.pos..app.input.pos, "agent-rules").unwrap();
+    let third = app.input.clone();
+    submit(&mut app, &mut live, &mut out);
+    assert_eq!(app.frame().queued, ["second", &third.text]);
+    assert_eq!(peer.borrow().prompts.len(), 1);
+    app.settings = Settings::default();
+    app.event(key(KeyCode::Up, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input, third);
+    assert_eq!(app.settings, settings);
+    assert_eq!(app.frame().queued, ["second"]);
+    app.input.insert("edited").unwrap();
+    submit(&mut app, &mut live, &mut out);
+    app.input.insert("next draft 👩‍💻").unwrap();
+    let draft = app.input.clone();
+    app.settings = Settings::default();
+    for text in ["first", "second", "third $agent-rules edited"] {
+      assert_eq!(peer.borrow().prompts.last().unwrap().text, text);
+      peer
+        .borrow_mut()
+        .events
+        .extend([agent::Event::Text(text.into()), agent::Event::Finished(Ok(()))]);
+      app.poll(&mut live, &mut out, 80).unwrap();
+      assert_eq!(app.input, draft);
+    }
+    let peer = peer.borrow();
+    assert_eq!(peer.prompts.len(), 3);
+    assert_eq!(peer.prompts[1].settings, Settings::default());
+    assert_eq!(peer.prompts[2].settings, settings);
+    assert_eq!(peer.prompts[2].skills, ["agent-rules"]);
+    assert!(app.request.is_none() && app.queue.is_empty());
+    app.event(key(KeyCode::Up, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input.text, "third $agent-rules edited");
+    app.event(key(KeyCode::Down, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input, draft);
+  }
+
+  #[test]
+  fn cancellation_and_errors_pause_the_queue_until_enter_and_clear_discards_it() {
+    for cancel in [true, false] {
+      let peer = Rc::new(RefCell::new(Peer::default()));
+      let mut app = App::new(Box::new(Script(peer.clone())));
+      let (mut live, mut out) = (Live::default(), Vec::new());
+      for text in ["first", "second", "third"] {
+        app.input.insert(text).unwrap();
+        submit(&mut app, &mut live, &mut out);
+      }
+      if cancel {
+        assert_eq!(app.event(key(KeyCode::Esc, Mods::NONE), 80).unwrap(), Action::Cancel);
+        app.cancel();
+      }
+      peer.borrow_mut().events.push_back(agent::Event::Finished(if cancel {
+        Ok(())
+      } else {
+        Err(io::Error::other("offline").into())
+      }));
+      app.poll(&mut live, &mut out, 80).unwrap();
+      assert!(app.request.is_none() && app.frame().paused);
+      assert_eq!(app.frame().queued, ["second", "third"]);
+      assert_eq!(peer.borrow().prompts.len(), 1);
+      app.poll(&mut live, &mut out, 80).unwrap();
+      assert_eq!(peer.borrow().prompts.len(), 1);
+      submit(&mut app, &mut live, &mut out);
+      app.poll(&mut live, &mut out, 80).unwrap();
+      assert_eq!(peer.borrow().prompts[1].text, "second");
+      assert!(!app.paused);
+      app.clear(&mut live, &mut out, 24).unwrap();
+      app.poll(&mut live, &mut out, 80).unwrap();
+      assert!(app.queue.is_empty() && app.request.is_none());
+      assert_eq!(peer.borrow().prompts.len(), 2);
+    }
+  }
+
+  #[test]
+  fn history_arrows_respect_rows_menus_and_restore_a_draft_after_resubmitting() {
+    let mut app = App::default();
+    app.input.insert("first\n界 e\u{301}").unwrap();
+    let Action::Send(_) = app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap() else { panic!() };
+    app.input.insert("second").unwrap();
+    let Action::Send(_) = app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap() else { panic!() };
+    app.input.insert("draft\n👩‍💻 tail").unwrap();
+    app.event(key(KeyCode::Up, Mods::NONE), 80).unwrap();
+    let draft = app.input.clone();
+    assert_eq!(draft.text, "draft\n👩‍💻 tail");
+    app.event(key(KeyCode::Up, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input.text, "second");
+    app.event(key(KeyCode::Up, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input.text, "first\n界 e\u{301}");
+    app.event(key(KeyCode::Down, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input.text, "second");
+    app.input.insert(" edited").unwrap();
+    let Action::Send(prompt) = app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap() else {
+      panic!()
+    };
+    assert_eq!(prompt.text, "second edited");
+    assert_eq!(app.input, draft);
+    app.input = Input::default();
+    type_text(&mut app, "/");
+    app.event(key(KeyCode::Up, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input.text, "/");
+    assert!(!app.history.browsing());
+    app.event(key(KeyCode::Esc, Mods::NONE), 80).unwrap();
+    app.event(key(KeyCode::Up, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input.text, "second edited");
+    app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap();
+    assert!(!app.history.browsing());
+    app.event(key(KeyCode::Down, Mods::NONE), 80).unwrap();
+    assert_eq!(app.input, Input::default());
   }
 
   #[test]
@@ -965,7 +1157,7 @@ mod tests {
   }
 
   #[test]
-  fn streaming_and_failure_keep_the_next_draft_and_the_last_queued_text() {
+  fn streaming_and_failure_keep_the_next_draft_and_final_response() {
     let peer = Rc::new(RefCell::new(Peer::default()));
     let mut app = App::new(Box::new(Script(peer.clone())));
     let mut live = Live::default();
@@ -980,7 +1172,6 @@ mod tests {
     app.event(Event::Paste("next 界\ndraft".into()), 80).unwrap();
     app.event(key(KeyCode::Left, Mods::NONE), 80).unwrap();
     let draft = app.input.clone();
-    assert_eq!(app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap(), Action::None);
     assert_eq!(peer.borrow().prompts, [Prompt::from("original\nquestion")]);
     peer.borrow_mut().events.extend([
       agent::Event::Phase(Phase::Generating),
@@ -1028,7 +1219,6 @@ mod tests {
     app.cancel();
     live.draw(&mut out, &app.frame(), 80, 24).unwrap();
     assert_eq!(app.frame().activity.as_deref(), Some("• Cancelling (0s)"));
-    assert_eq!(app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap(), Action::None);
     assert_eq!(peer.borrow().cancels, 1);
     peer.borrow_mut().events.extend([
       agent::Event::Text("discarded after cancel".into()),
