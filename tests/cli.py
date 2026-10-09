@@ -256,7 +256,7 @@ class Terminal:
         rows = self.transcript.splitlines()
         end = max(i for i, row in enumerate(rows) if row == "  " + summary) - 1
         lines = expected.split("\n")
-        for prefix in ("  ", "┃ "):
+        for prefix in ("", "┃ "):
             # pyte normalizes combining marks when it builds terminal cells.
             block = [unicodedata.normalize("NFC", (prefix + line.replace("\t", "    ")).rstrip())
                      for line in lines]
@@ -316,7 +316,7 @@ def tui(binary):
         require(not terminal.screen.buffer[2][2].bold, "Draft text must not be bold")
         summary = terminal.submit(text)
         expected = ["┃ first line", "┃", "┃ second line", "┃", "┃ third line", "",
-                    "  first line", "", "  second line", "", "  third line", "",
+                    "first line", "", "second line", "", "third line", "",
                     "  " + summary, "", "┃", ""]
         require([row.rstrip() for row in terminal.screen.display[2:18]] == expected,
                 "Conversation spacing differs from the supplied reference")
@@ -411,11 +411,10 @@ def mock_lifecycle(binary):
         terminal.until(lambda: "Generating (1s)" in terminal.display, "mock generation")
         terminal.until(lambda: "(↑1 ↓1)" in terminal.display, "live token counter")
         require("┃ next draft" in terminal.display, "Generation swallowed the next draft")
-        require("  hi!" not in terminal.display, "Short echo should follow the generating phase")
         terminal.until(lambda: SUMMARY.search(terminal.output[start:])
                        and "2/272k 0%" in terminal.display, "final mock statistics and status")
         require("(↑1 ↓1)" in SUMMARY.search(terminal.output[start:])[1], "Wrong final counts")
-        require("  hi!" in terminal.display and "┃ next draft" in terminal.display,
+        require("\nhi!\n" in terminal.display and "┃ next draft" in terminal.display,
                 "Final answer or next draft lost")
         require("2/272k 0%" in terminal.display, "Context count missing after completion")
         require("Thinking" not in terminal.display and "Generating" not in terminal.display,
@@ -443,7 +442,10 @@ def mock_lifecycle(binary):
         terminal.paste("still here")
         terminal.until(lambda: "┃ still here" in terminal.display, "draft after exit timeout")
         terminal.send("\x03")
-        terminal.until(lambda: "press ctrl+c again to exit" in terminal.display, "exit confirmation")
+        terminal.until(lambda: "still here" not in terminal.display
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃"
+                       and "press ctrl+c again to exit" in terminal.display,
+                       "ctrl+c clears the draft and shows the exit hint in an existing session")
         terminal.exit("\x03")
     finally:
         terminal.close()
@@ -464,8 +466,12 @@ def menus(binary):
         terminal.until(lambda: "┃ draft" in terminal.display, "typing after copy feedback")
         require("* No assistant reply to copy." in terminal.display,
                 "Clipboard feedback disappeared from history")
+        terminal.send("\x03")
+        terminal.until(lambda: "┃ draft" not in terminal.display
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃"
+                       and "press ctrl+c again to exit" in terminal.display,
+                       "ctrl+c clears the fresh draft and shows the exit hint")
         terminal.exit("\x03")
-        require("again to exit" not in terminal.output, "Empty session asked for exit confirmation")
     finally:
         terminal.close()
 

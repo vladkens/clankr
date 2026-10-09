@@ -27,8 +27,10 @@ pub struct Frame<'a> {
 
 #[derive(Default)]
 pub struct Live {
-  frozen: String,
+  // Text already written to native scrollback; only the footer is repainted.
   shown: String,
+  // Current output block, restarted only when resize cannot preserve its anchor.
+  start: usize,
   lines: Vec<Line>,
   cursor: (usize, u16),
   cols: u16,
@@ -66,7 +68,6 @@ impl Origin {
 
 #[derive(Default)]
 struct Line {
-  end: usize,
   text: String,
   style: Style,
   origin: Origin,
@@ -117,15 +118,27 @@ fn clean(text: &str, cursor: usize) -> (String, usize) {
 
 fn wrap(text: &str, cols: u16, first: &str, rest: &str, style: Style) -> Vec<Line> {
   let layout = Layout::new(text, cols, first, rest);
-  layout
-    .rows
-    .into_iter()
-    .map(|row| Line { text: row.text, end: row.end, style, ..Line::default() })
-    .collect()
+  layout.rows.into_iter().map(|row| Line { text: row.text, style, ..Line::default() }).collect()
 }
 
 fn block(text: &str, cols: u16, style: Style) -> Vec<Line> {
   if text.is_empty() { Vec::new() } else { wrap(text, cols, "  ", "  ", style) }
+}
+
+// Native wrap uses every cell; unlike the editor it adds no decorative prefix.
+fn edge(text: &str, cols: u16) -> u16 {
+  let width = usize::from(cols.max(1));
+  let mut used = 0;
+  let mut edge = 0;
+  for g in text.graphemes(true) {
+    let size = g.width();
+    if used + size > width {
+      used = 0;
+    }
+    edge = used as u16;
+    used += size;
+  }
+  edge
 }
 
 fn nonempty(value: Option<&str>) -> Option<String> {
@@ -189,6 +202,12 @@ pub fn header(out: &mut impl Write) -> Res<()> {
   Ok(())
 }
 
+pub fn separator(out: &mut impl Write, cols: u16) -> Res<()> {
+  write!(out, "\r\x1b[0m{}", "─".repeat(usize::from(cols.saturating_sub(1))))?;
+  out.flush()?;
+  Ok(())
+}
+
 impl Live {
   pub fn terminal() -> Self {
     let term = std::env::var("TERM").unwrap_or_default();
@@ -225,8 +244,7 @@ impl Live {
       if same {
         continue;
       }
-      // EL from column zero clears the row AND its soft-wrap edge in Ghostty; EL 2 leaves
-      // the wrap edge intact. Every row written by this renderer has a hard CRLF boundary.
+      // Only UI rows are erased here. Response rows retain their native soft-wrap edges.
       queue!(out, Clear(ClearType::UntilNewLine))?;
       if let Some(line) = lines.get(i) {
         line.write(out)?;
@@ -249,17 +267,6 @@ impl Live {
         pos = (i, line.text.width() as u16);
       }
     }
-    if self.redraw && changed {
-      if let Some(start) = lines.iter().position(|line| line.origin == Origin::Prompt) {
-        // Save after all CRLF scrolling. Ghostty remaps this anchor through resize and clamps
-        // it to the top when the cleared owned rows no longer fit in the active screen.
-        position(out, &mut pos, (start, 0))?;
-        queue!(out, SavePosition)?;
-        out.write_all(b"\x1b]133;B\x07")?;
-      } else {
-        Origin::Transcript.write(out)?;
-      }
-    }
     position(out, &mut pos, cursor)?;
     Ok(changed)
   }
@@ -268,37 +275,110 @@ impl Live {
     self.invalidated = true;
   }
 
+  // Re-establish the footer below the terminal-owned response cursor after reflow.
   fn relocated(&mut self, out: &mut impl Write, rows: u16) -> Res<()> {
     if self.lines.is_empty() {
       return Ok(());
     }
-    if self.redraw {
-      // The terminal erased only the marked prompt before reflow, including any rows which
-      // would otherwise escape into scrollback. The saved origin is terminal-owned: neither
-      // old wrap counts nor the editor cursor are used as an absolute screen position.
-      queue!(out, RestorePosition, MoveToColumn(0))?;
-      // A coalesced resize can report our old dimensions again. Clear the owned suffix at
-      // its remapped origin even if the terminal did not actually change size this time.
+    let clipped = self.gap() > 0 && usize::from(rows) <= self.cursor.0 + self.gap();
+    if self.redraw && !clipped {
+      queue!(out, RestorePosition)?;
+      if self.gap() > 0 {
+        Origin::Transcript.write(out)?;
+        out.write_all(self.shown.graphemes(true).next_back().unwrap().as_bytes())?;
+        write!(out, "\r\n")?;
+      }
+      // Also handle a resize notification coalesced back to the previous dimensions.
+      queue!(out, SavePosition)?;
       for i in 0..self.lines.len().min(usize::from(rows)) {
         if i > 0 {
           queue!(out, MoveDown(1))?;
         }
         queue!(out, Clear(ClearType::UntilNewLine))?;
       }
-      queue!(out, RestorePosition, MoveToColumn(0))?;
-      self.lines.clear();
-      self.cursor = (0, 0);
-      self.shown.clone_from(&self.frozen);
-      return Ok(());
+      queue!(out, RestorePosition)?;
+    } else {
+      // Unknown reflow or an anchor pushed outside the screen cannot be recovered.
+      // Preserve the text and continue a new block rather than overwrite history.
+      queue!(out, MoveDown(u16::MAX))?;
+      write!(out, "\x1b[0m\r\n")?;
+      self.start = self.shown.len();
     }
-    // Unknown reflow is not recoverable from the written row widths. Move to the physical
-    // bottom without guessing wraps, then append; this fallback can retain a stale footer.
-    queue!(out, MoveDown(u16::MAX))?;
-    write!(out, "\x1b[0m\r\n")?;
-    self.frozen.clone_from(&self.shown);
     self.lines.clear();
     self.cursor = (0, 0);
+    self.anchor(out)?;
     Ok(())
+  }
+
+  fn gap(&self) -> usize {
+    usize::from(self.shown.len() > self.start && !self.shown.ends_with('\n'))
+  }
+
+  // Save AFTER footer allocation, since native scrolling moves the response upwards.
+  // Anchor a real cell: reflow can discard the blank insertion cell after the text.
+  fn anchor(&self, out: &mut impl Write) -> Res<()> {
+    let mut pos = self.cursor;
+    position(out, &mut pos, (0, 0))?;
+    if self.gap() > 0 {
+      queue!(out, MoveUp(1))?;
+      let text = self.shown[self.start..].rsplit('\n').next().unwrap_or("");
+      let col = edge(text, self.cols);
+      queue!(out, MoveToColumn(col))?;
+    }
+    queue!(out, SavePosition)?;
+    if self.gap() > 0 {
+      queue!(out, MoveDown(1), MoveToColumn(0))?;
+    }
+    pos = (0, 0);
+    if self.redraw {
+      out.write_all(b"\x1b]133;B\x07")?;
+    }
+    position(out, &mut pos, self.cursor)?;
+    Ok(())
+  }
+
+  fn append(&mut self, out: &mut impl Write, response: &str, complete: bool) -> Res<bool> {
+    if !response.starts_with(&self.shown) {
+      return Err(invalid("Response changed an already written prefix").into());
+    }
+    if !complete && self.rows < 2 {
+      return Ok(false);
+    }
+    // A later chunk may extend a grapheme (combining mark, emoji ZWJ, etc.).
+    // Keep just that last grapheme until its boundary is known or the stream ends.
+    let end = if complete || response.ends_with('\n') {
+      response.len()
+    } else {
+      response.grapheme_indices(true).next_back().map_or(0, |(i, _)| i)
+    };
+    if end <= self.shown.len() {
+      return Ok(false);
+    }
+    self.patch(out, &[], (0, 0))?;
+    if !self.lines.is_empty() || self.shown.len() > self.start {
+      queue!(out, RestorePosition)?;
+    }
+    if self.redraw {
+      Origin::Transcript.write(out)?;
+    }
+    if self.gap() > 0 {
+      // Restore the last grapheme as well as the cursor, recreating pending-wrap
+      // when it occupied the rightmost cell before we moved down to the editor.
+      out.write_all(self.shown.graphemes(true).next_back().unwrap().as_bytes())?;
+    }
+    for part in response[self.shown.len()..end].split_inclusive('\n') {
+      out.write_all(part.trim_end_matches('\n').as_bytes())?;
+      if part.ends_with('\n') {
+        out.write_all(b"\r\n")?;
+      }
+    }
+    self.shown = response[..end].into();
+    if self.gap() > 0 {
+      out.write_all(b"\r\n")?;
+    }
+    self.lines.clear();
+    self.cursor = (0, 0);
+    Ok(true)
   }
 
   pub fn clear(&mut self, out: &mut impl Write) -> Res<()> {
@@ -340,7 +420,7 @@ impl Live {
     update(out, bytes, self.sync)?;
     self.lines.clear();
     self.cursor = (0, 0);
-    self.frozen.clear();
+    self.start = 0;
     self.shown.clear();
     Ok(())
   }
@@ -359,16 +439,6 @@ impl Live {
     Ok(())
   }
 
-  fn check_prefix(&self, response: &str, resizing: bool) -> Res<()> {
-    let prefix = if resizing && !self.redraw { &self.shown } else { &self.frozen };
-    if !response.starts_with(prefix) {
-      return Err(
-        invalid("Response changed an already retained prefix; finish each stream first").into(),
-      );
-    }
-    Ok(())
-  }
-
   pub fn draw(&mut self, out: &mut impl Write, frame: &Frame<'_>, cols: u16, rows: u16) -> Res<()> {
     if cols == 0 || rows == 0 {
       return Err(invalid("Terminal dimensions must be nonzero").into());
@@ -376,18 +446,20 @@ impl Live {
     let response = clean(frame.response, 0).0;
     let resizing =
       !self.lines.is_empty() && (self.invalidated || cols != self.cols || rows != self.rows);
-    self.check_prefix(&response, resizing)?;
     let mut bytes = Vec::new();
+    self.cols = cols;
     if resizing {
       self.relocated(&mut bytes, rows)?;
     }
-    self.cols = cols;
     self.rows = rows;
     self.invalidated = false;
 
+    let appended = self.append(&mut bytes, &response, false)?;
     let thinking = nonempty(frame.activity.as_deref());
-    let active = !response.is_empty() || thinking.is_some();
-    let reserve = if active && rows >= 5 { 2 } else { 0 };
+    let gap = usize::from(!self.shown.is_empty());
+    let reserve = self.gap().min(usize::from(rows.saturating_sub(1)));
+    let budget = usize::from(rows) - reserve;
+    let extra = (gap + usize::from(thinking.is_some()) * 2).min(budget.saturating_sub(1));
     let (footer, cursor) = footer(
       frame.input,
       frame.notice,
@@ -395,66 +467,38 @@ impl Live {
       frame.menu,
       frame.messages,
       cols,
-      usize::from(rows) - reserve,
+      budget - extra,
     );
-    let budget = usize::from(rows) - footer.len();
-    let mut body = Vec::new();
-    let mut prefix = Vec::new();
-    let offset = self.frozen.len();
-    let mut shown = offset;
-
-    if !response.is_empty() {
-      let mut tail = block(&response[offset..], cols, Style::Plain);
-      let mut activity =
-        thinking.as_deref().map(|text| wrap(text, cols, "", "", Style::Plain)).unwrap_or_default();
-      activity.truncate(budget.saturating_sub(3));
-      let space =
-        budget.saturating_sub(1 + if activity.is_empty() { 0 } else { activity.len() + 1 });
-      // Keep the last row mutable: later deltas can extend its last grapheme or change wrapping.
-      let count = tail.len().saturating_sub(space.max(1));
-      for line in tail.drain(..count) {
-        shown = offset + line.end;
-        prefix.push(line);
-      }
-      self.frozen = response[..shown].to_owned();
-      tail.truncate(space);
-      if let Some(last) = tail.last() {
-        shown = offset + last.end;
-      }
-      body.extend(tail);
-      if !body.is_empty() {
-        body.push(Line::default());
-      }
+    let mut lines = Vec::new();
+    if gap > 0 && extra > 0 {
+      lines.push(Line::default());
+    }
+    if let Some(text) = thinking {
+      let mut activity = wrap(&text, cols, "", "", Style::Plain);
+      activity.truncate(extra.saturating_sub(lines.len() + 1));
       if !activity.is_empty() {
-        body.extend(activity);
-        body.push(Line::default());
-      }
-    } else if let Some(text) = thinking {
-      body = wrap(&text, cols, "", "", Style::Plain);
-      body.truncate(budget.saturating_sub(1));
-      if !body.is_empty() {
-        body.push(Line::default());
+        lines.extend(activity);
+        lines.push(Line::default());
       }
     }
-    self.shown = response[..shown].to_owned();
-    let cursor = (body.len() + cursor.0, cursor.1);
-    body.extend(footer);
-    let count = prefix.len();
-    prefix.extend(body);
+    let cursor = (lines.len() + cursor.0, cursor.1);
+    lines.extend(footer);
     if self.redraw {
-      for (i, line) in prefix.iter_mut().enumerate().skip(count) {
-        line.origin = if i == count { Origin::Prompt } else { Origin::Continuation };
+      for (i, line) in lines.iter_mut().enumerate() {
+        line.origin = if i == 0 { Origin::Prompt } else { Origin::Continuation };
       }
     }
-    let changed = self.patch(&mut bytes, &prefix, (count + cursor.0, cursor.1))?;
-    update(out, bytes, (changed || resizing) && self.sync)?;
-    self.lines = prefix.drain(count..).collect();
+    let changed = self.patch(&mut bytes, &lines, cursor)?;
+    self.lines = lines;
     self.cursor = cursor;
+    if changed || resizing || appended {
+      self.anchor(&mut bytes)?;
+    }
+    update(out, bytes, (changed || resizing || appended) && self.sync)?;
     Ok(())
   }
 
-  /// Freeze only the not-yet-committed suffix of the full accumulated answer, then its summary.
-  /// Leaves one blank row before the next prompt; no draft or model footer is frozen normally.
+  /// Flush the final grapheme and summary, leaving the next editor below native history.
   pub fn finish(
     &mut self,
     out: &mut impl Write,
@@ -464,12 +508,13 @@ impl Live {
   ) -> Res<()> {
     let response = clean(response, 0).0;
     let resizing = !self.lines.is_empty() && (self.invalidated || cols != self.cols);
-    self.check_prefix(&response, resizing)?;
     let mut bytes = Vec::new();
+    self.cols = cols;
     if resizing {
       self.relocated(&mut bytes, self.rows)?;
     }
-    let mut lines = block(&response[self.frozen.len()..], cols, Style::Plain);
+    let appended = self.append(&mut bytes, &response, true)?;
+    let mut lines = Vec::new();
     if !response.is_empty() {
       lines.push(Line::default());
     }
@@ -479,10 +524,10 @@ impl Live {
     }
     lines.push(Line::default());
     let changed = self.patch(&mut bytes, &lines, (lines.len() - 1, 0))?;
-    update(out, bytes, (changed || resizing) && self.sync)?;
+    update(out, bytes, (changed || resizing || appended) && self.sync)?;
     self.lines.clear();
     self.cursor = (0, 0);
-    self.frozen.clear();
+    self.start = 0;
     self.shown.clear();
     self.invalidated = false;
     Ok(())
@@ -673,11 +718,13 @@ mod tests {
     col: usize,
     top: usize,
     height: usize,
+    width: usize,
+    pending: bool,
     sync: bool,
     snapshots: Vec<String>,
     erased: Vec<usize>,
     prompt: bool,
-    saved: Option<(usize, usize)>,
+    saved: Option<(usize, usize, bool)>,
   }
 
   impl Screen {
@@ -690,6 +737,8 @@ mod tests {
         col: 0,
         top: 0,
         height,
+        width: 80,
+        pending: false,
         sync: false,
         snapshots: Vec::new(),
         erased: Vec::new(),
@@ -706,11 +755,11 @@ mod tests {
           '\x1b' => {
             match chars.next().unwrap() {
               '7' => {
-                self.saved = Some((self.row, self.col));
+                self.saved = Some((self.row, self.col, self.pending));
                 continue;
               }
               '8' => {
-                (self.row, self.col) = self.saved.unwrap();
+                (self.row, self.col, self.pending) = self.saved.unwrap();
                 continue;
               }
               ']' => {
@@ -773,6 +822,7 @@ mod tests {
               continue;
             }
             let n: usize = if arg.is_empty() { 0 } else { arg.parse().unwrap() };
+            self.pending = false;
             match cmd {
               'A' => self.row = self.row.saturating_sub(n).max(self.top),
               'B' => self.row = (self.row + n).min(self.top + self.height - 1),
@@ -789,7 +839,10 @@ mod tests {
               _ => panic!("forbidden terminal command: {arg}{cmd}"),
             }
           }
-          '\r' => self.col = 0,
+          '\r' => {
+            self.col = 0;
+            self.pending = false;
+          }
           '\n' => {
             self.row += 1;
             self.top = self.top.max((self.row + 1).saturating_sub(self.height));
@@ -800,13 +853,41 @@ mod tests {
           }
           c => {
             assert!(!c.is_control());
-            self.lines.resize_with(self.lines.len().max(self.row + 1), String::new);
-            let line = &mut self.lines[self.row];
-            // Writes start on a new/cleared row; cursor-only positioning never inserts text.
-            assert!(line.width() <= self.col);
-            line.push_str(&" ".repeat(self.col - line.width()));
-            line.push(c);
-            self.col = line.width();
+            let mut text = c.to_string();
+            while chars.peek().is_some_and(|c| !c.is_control()) {
+              text.push(chars.next().unwrap());
+            }
+            for g in text.graphemes(true) {
+              let width = g.width();
+              if self.pending || self.col + width > self.width {
+                self.wraps.resize(self.row + 1, false);
+                self.wraps[self.row] = true;
+                self.row += 1;
+                self.top = self.top.max((self.row + 1).saturating_sub(self.height));
+                self.col = 0;
+                self.pending = false;
+              }
+              self.lines.resize_with(self.lines.len().max(self.row + 1), String::new);
+              let line = &mut self.lines[self.row];
+              let mut used = 0;
+              let end = line.grapheme_indices(true).find_map(|(i, g)| {
+                if used >= self.col {
+                  return Some(i);
+                }
+                used += g.width();
+                None
+              });
+              if let Some(end) = end {
+                line.truncate(end);
+              }
+              line.push_str(&" ".repeat(self.col.saturating_sub(line.width())));
+              line.push_str(g);
+              self.col += width;
+              if self.col >= self.width {
+                self.col = self.width - 1;
+                self.pending = true;
+              }
+            }
           }
         }
       }
@@ -833,8 +914,8 @@ mod tests {
       let mut saved = None;
       let mut line = String::new();
       for (i, text) in self.lines.iter().enumerate() {
-        if self.saved.is_some_and(|(row, _)| row == i) {
-          saved = Some((lines.len(), line.width()));
+        if self.saved.is_some_and(|(row, _, _)| row == i) {
+          saved = Some((lines.len(), line.width(), false));
         }
         let mut used = 0;
         for g in text.graphemes(true) {
@@ -846,8 +927,21 @@ mod tests {
           if i == self.row && used <= self.col {
             cursor = (lines.len(), line.width());
           }
+          if let Some((row, col, pending)) = self.saved
+            && row == i
+            && used <= col
+            && col < used + g.width()
+          {
+            saved = Some((lines.len(), line.width() + col - used, pending));
+          }
           line.push_str(g);
           used += g.width();
+        }
+        if let Some((row, col, pending)) = self.saved
+          && row == i
+          && col >= used
+        {
+          saved = Some((lines.len(), line.width(), pending));
         }
         if i == self.row && self.col >= used {
           cursor = (lines.len(), line.width());
@@ -863,13 +957,21 @@ mod tests {
       self.wraps = wraps;
       (self.row, self.col) = cursor;
       self.height = rows;
+      self.width = usize::from(cols);
+      self.pending = false;
       self.top = (self.row + 1).saturating_sub(rows);
       // Model a terminal which keeps the cursor visible and clips rows below the new screen.
       self.lines.truncate(self.top + self.height);
       self.origins.truncate(self.lines.len());
       self.wraps.truncate(self.lines.len());
-      self.saved = saved.map(|(row, col)| {
-        if row < self.top || row >= self.top + self.height { (self.top, 0) } else { (row, col) }
+      self.saved = saved.map(|(row, col, pending)| {
+        if row < self.top || row >= self.top + self.height {
+          (self.top, 0, false)
+        } else if pending && col != self.width - 1 {
+          (row, col + 1, false)
+        } else {
+          (row, col, pending)
+        }
       });
     }
   }
@@ -1007,6 +1109,68 @@ mod tests {
     assert!(!output.contains("\x1b[2J") && !output.contains("\x1b[3J"));
     assert!(!supports_redraw("xterm-ghostty", "ghostty", "unknown", false));
     assert!(!supports_redraw("xterm-ghostty", "ghostty", "1.3.1", true));
+  }
+
+  #[test]
+  fn clipped_response_anchor_keeps_text_and_defers_streaming_in_one_row() {
+    let mut live = Live { redraw: true, ..Live::default() };
+    let mut screen = Screen::new(12);
+    let mut input = Input::default();
+    input.insert(&"draft\n".repeat(8)).unwrap();
+    let mut response = "retained before resize.".to_owned();
+    apply(&mut screen, |out| {
+      live.draw(out, &Frame { response: &response, ..frame(&input) }, 80, 12).unwrap()
+    });
+    screen.resize(40, 1);
+    live.resize();
+    response.push_str(" New portion.");
+    apply(&mut screen, |out| {
+      live.draw(out, &Frame { response: &response, ..frame(&input) }, 40, 1).unwrap()
+    });
+    assert!(!screen.text().contains("New portion"));
+    screen.resize(80, 12);
+    live.resize();
+    apply(&mut screen, |out| {
+      live.draw(out, &Frame { response: &response, ..frame(&input) }, 80, 12).unwrap()
+    });
+    apply(&mut screen, |out| live.finish(out, &response, None, 80).unwrap());
+    assert_eq!(screen.text().replace('\n', ""), response);
+  }
+
+  #[test]
+  fn native_wrap_keeps_streamed_paragraphs_and_source_newlines_copyable() {
+    let mut live = Live { redraw: true, sync: true, ..Live::default() };
+    let mut screen = Screen::new(12);
+    let mut input = Input::default();
+    let text =
+      format!("{}\n\n    {}\nnext", "paragraph-界-e\u{301}-👩‍💻 ".repeat(80), "code ".repeat(40));
+    let mut response = String::new();
+    let (mut cols, mut rows) = (80, 12);
+    apply(&mut screen, |out| live.prompt(out, "question", cols).unwrap());
+    for (i, c) in text.chars().enumerate() {
+      response.push(c);
+      if i % 100 == 0 {
+        input = Input::default();
+        input.insert(if i % 200 == 0 { "editing\na draft" } else { "next" }).unwrap();
+      }
+      if i == 300 || i == 600 {
+        (cols, rows) = if i == 300 { (40, 12) } else { (80, 24) };
+        screen.resize(cols, usize::from(rows));
+        live.resize();
+      }
+      apply(&mut screen, |out| {
+        live.draw(out, &Frame { response: &response, ..frame(&input) }, cols, rows).unwrap()
+      });
+    }
+    apply(&mut screen, |out| live.finish(out, &response, None, cols).unwrap());
+    let mut selected = String::new();
+    for (i, line) in screen.lines.iter().enumerate() {
+      selected.push_str(line);
+      if !screen.wraps[i] {
+        selected.push('\n');
+      }
+    }
+    assert_eq!(selected.trim_end(), format!("┃ question\n\n{text}"));
   }
 
   #[test]

@@ -73,9 +73,8 @@ pub struct Echo {
 struct Reply {
   prompt: Prompt,
   usage: Usage,
-  total: u64,
   phase: Phase,
-  sent: bool,
+  sent: usize,
   next: Instant,
   finish: Instant,
 }
@@ -90,9 +89,8 @@ impl Echo {
     self.reply = Some(Reply {
       prompt,
       usage,
-      total,
       phase: Phase::Thinking,
-      sent: false,
+      sent: 0,
       next: now + Duration::from_millis(1200),
       finish: now + Duration::from_millis(2000),
     });
@@ -116,17 +114,22 @@ impl Echo {
       reply.next = now + Duration::from_millis(50);
       return Some(Event::Phase(Phase::Generating));
     }
-    if reply.usage.output < reply.total {
-      reply.usage.output = (reply.usage.output + reply.total.div_ceil(12)).min(reply.total);
+    if reply.sent < reply.prompt.text.len() {
+      let chunk = reply.prompt.text.len().div_ceil(12);
+      let end = reply.prompt.text[reply.sent..]
+        .char_indices()
+        .map(|(i, c)| reply.sent + i + c.len_utf8())
+        .find(|&end| end - reply.sent >= chunk)
+        .unwrap_or(reply.prompt.text.len());
+      let text = reply.prompt.text[reply.sent..end].to_owned();
+      reply.sent = end;
+      reply.usage.output = reply.prompt.text[..end].chars().count().div_ceil(4) as u64;
+      self.usage = Some(reply.usage);
       reply.next = now + Duration::from_millis(50);
-      if reply.usage.output == reply.total {
+      if end == reply.prompt.text.len() {
         reply.next = reply.next.max(reply.finish);
       }
-      return Some(Event::Usage(reply.usage));
-    }
-    if !reply.sent {
-      reply.sent = true;
-      return Some(Event::Text(std::mem::take(&mut reply.prompt.text)));
+      return Some(Event::Text(text));
     }
     self.context += reply.usage.input + reply.usage.output;
     self.reply = None;
@@ -172,6 +175,7 @@ mod tests {
       assert!(matches!(echo.poll_at(now), Some(Event::Usage(Usage { output: 0, .. }))));
       assert!(echo.poll_at(now + Duration::from_millis(1199)).is_none());
       let mut response = String::new();
+      let mut chunks = 0;
       let mut generating = false;
       let mut finished = false;
       let mut usage = None;
@@ -181,7 +185,8 @@ mod tests {
             Event::Phase(Phase::Generating) => generating = true,
             Event::Phase(Phase::Thinking) => panic!(),
             Event::Text(text) => {
-              assert!(generating && ms >= 2000);
+              assert!(generating && ms < 2000);
+              chunks += 1;
               response.push_str(&text);
             }
             Event::Usage(counts) => usage = Some(counts),
@@ -196,6 +201,7 @@ mod tests {
       }
       assert!(finished && generating);
       assert_eq!(response, prompt);
+      assert!(chunks > 0 && (prompt.len() == 1 || chunks > 1));
       let count = prompt.chars().count().div_ceil(4) as u64;
       assert_eq!(usage, Some(Usage { input: count, output: count }));
       assert_eq!(echo.status().context, Some((count * 2, 272_000)));

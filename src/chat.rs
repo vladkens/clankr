@@ -140,6 +140,7 @@ struct App {
   request: Option<Request>,
   has_session: bool,
   exit_deadline: Option<Instant>,
+  draft_cleared: bool,
   menu: Option<Menu>,
   settings: Settings,
   last_response: Option<String>,
@@ -161,6 +162,7 @@ impl App {
       request: None,
       has_session: false,
       exit_deadline: None,
+      draft_cleared: false,
       menu: None,
       settings: Settings::default(),
       last_response: None,
@@ -215,6 +217,7 @@ impl App {
     self.menu = None;
     self.notice = None;
     self.exit_deadline = None;
+    self.draft_cleared = false;
     live.restart(out, rows)
   }
 
@@ -350,10 +353,21 @@ impl App {
       if self.request.is_some() {
         self.notice = None;
         self.exit_deadline = None;
+        self.draft_cleared = false;
         return Ok(Action::Cancel);
       }
+      if !self.input.text.is_empty() {
+        self.input = Input::default();
+        self.notice = Some("press ctrl+c again to exit".into());
+        self.exit_deadline = None;
+        self.draft_cleared = true;
+        return Ok(Action::None);
+      }
       let now = Instant::now();
-      if !self.has_session || self.exit_deadline.is_some_and(|deadline| now < deadline) {
+      if !self.has_session
+        || self.draft_cleared
+        || self.exit_deadline.is_some_and(|deadline| now < deadline)
+      {
         return Ok(Action::Exit);
       }
       self.exit_deadline = Some(now + Duration::from_secs(3));
@@ -361,6 +375,7 @@ impl App {
       return Ok(Action::None);
     }
     self.exit_deadline = None;
+    self.draft_cleared = false;
     self.notice = None;
     match event {
       Event::Key(key) => {
@@ -520,7 +535,8 @@ pub fn run() -> Res<()> {
   })();
   let stopped = app.stop(&mut live, &mut out, size.0.max(1));
   let cleared = live.clear(&mut out);
-  result.and(stopped).and(cleared)
+  result.and(stopped).and(cleared)?;
+  view::separator(&mut out, size.0.max(1))
 }
 
 #[cfg(test)]
@@ -847,17 +863,51 @@ mod tests {
     assert_eq!(app.input.text, "$age");
     assert!(!String::from_utf8(out).unwrap().contains("exit"));
     assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::None);
-    assert!(app.notice.as_deref().unwrap().contains("again to exit"));
+    assert_eq!(app.input, Input::default());
+    assert_eq!(app.notice.as_deref(), Some("press ctrl+c again to exit"));
+    assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::Exit);
   }
 
   #[test]
   fn ctrl_c_exits_immediately_before_the_first_prompt() {
-    for draft in ["", "unsent draft", "/", "$"] {
-      let mut app = App::default();
-      type_text(&mut app, draft);
-      assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::Exit);
-      assert!(app.notice.is_none() && app.exit_deadline.is_none());
+    let mut app = App::default();
+    assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::Exit);
+    assert!(app.notice.is_none() && app.exit_deadline.is_none());
+  }
+
+  #[test]
+  fn ctrl_c_clears_the_whole_draft_before_exiting() {
+    for has_session in [false, true] {
+      for draft in ["unsent draft", " \n ", "first 界\ne\u{301} 👩‍💻", "/", "$"] {
+        let mut app = App { has_session, ..App::default() };
+        app.input.insert(draft).unwrap();
+        app.menu = Menu::open(&app.input, app.settings);
+        assert_eq!(app.menu.is_some(), matches!(draft, "/" | "$"));
+        assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::None);
+        assert_eq!(app.input, Input::default());
+        assert!(app.menu.is_none() && app.exit_deadline.is_none());
+        assert_eq!(app.notice.as_deref(), Some("press ctrl+c again to exit"));
+
+        app.event(Event::Resize(40, 12), 40).unwrap();
+        let mut release = KeyEvent::new(KeyCode::Char('c'), Mods::CONTROL);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(app.event(Event::Key(release), 40).unwrap(), Action::None);
+        assert_eq!(app.notice.as_deref(), Some("press ctrl+c again to exit"));
+        assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 40).unwrap(), Action::Exit);
+      }
     }
+
+    let mut app = App::default();
+    type_text(&mut app, "$age");
+    app.event(key(KeyCode::Right, Mods::NONE), 80).unwrap();
+    assert!(!app.input.skills.is_empty());
+    assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::None);
+    assert_eq!(app.input, Input::default());
+    type_text(&mut app, "new draft");
+    assert!(app.notice.is_none());
+    assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::None);
+    assert_eq!(app.input, Input::default());
+    assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::Exit);
   }
 
   #[test]
@@ -950,7 +1000,8 @@ mod tests {
     app.poll(&mut live, &mut out, 80).unwrap();
     live.draw(&mut out, &app.frame(), 80, 24).unwrap();
     let output = String::from_utf8(out).unwrap();
-    assert!(output.contains("first last"));
+    assert_eq!(app.last_response.as_deref(), Some("first last"));
+    assert!(output.contains(" last") && !output.contains("first"));
     assert!(output.contains("Error: connection lost"));
     assert!(output.contains("(↑13 ↓2)"));
     assert!(app.request.is_none());
@@ -983,7 +1034,8 @@ mod tests {
     ]);
     app.poll(&mut live, &mut out, 80).unwrap();
     let output = String::from_utf8(out).unwrap();
-    assert!(output.contains("kept") && output.contains("Cancelled"));
+    assert_eq!(app.last_response.as_deref(), Some("kept"));
+    assert!(output.contains("Cancelled"));
     assert!(!output.contains("discarded"));
     assert!(app.request.is_none());
     assert_eq!(app.input.text, "next");
@@ -1048,10 +1100,11 @@ mod tests {
     assert_eq!(app.input.text, "keep");
     assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::None);
     assert_eq!(app.notice.as_deref(), Some("press ctrl+c again to exit"));
-    assert_eq!(app.input.text, "keep");
+    assert_eq!(app.input, Input::default());
     app.event(key(KeyCode::Left, Mods::NONE), 80).unwrap();
     assert!(app.notice.is_none() && app.exit_deadline.is_none());
     assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::None);
+    assert_eq!(app.notice.as_deref(), Some("press ctrl+c again to exit"));
     assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::Exit);
     app.input = Input::default();
     assert_eq!(app.event(key(KeyCode::Char('d'), Mods::CONTROL), 80).unwrap(), Action::Exit);

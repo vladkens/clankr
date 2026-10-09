@@ -48,8 +48,6 @@ fn floor(text: &str, pos: usize) -> usize {
 
 pub struct Row {
   pub text: String,
-  // Exclusive source offset, including a consumed newline, for streaming output.
-  pub end: usize,
   pub stops: Vec<(usize, u16)>,
 }
 
@@ -71,7 +69,7 @@ impl Layout {
         String::new()
       }
     };
-    let row = |s: &str| Row { text: prefix(s), end: 0, stops: Vec::new() };
+    let row = |s: &str| Row { text: prefix(s), stops: Vec::new() };
     let mut line = row(first);
     let mut used = line.text.width();
     let mut indent = used;
@@ -82,7 +80,6 @@ impl Layout {
       let size = display.width().max(1);
       if g != "\n" && used + size > width && used > indent {
         line.stops.push((i, col(used)));
-        line.end = i;
         rows.push(line);
         line = row(rest);
         used = line.text.width();
@@ -90,7 +87,6 @@ impl Layout {
       }
       line.stops.push((i, col(used)));
       if g == "\n" {
-        line.end = i + g.len();
         rows.push(line);
         line = row(rest);
         used = line.text.width();
@@ -112,7 +108,6 @@ impl Layout {
       }
     }
     line.stops.push((text.len(), col(used)));
-    line.end = text.len();
     rows.push(line);
     Self { rows }
   }
