@@ -23,6 +23,7 @@ strip = false
 lto = false
 
 [dependencies]
+arboard = { version = "3.6.1", default-features = false }
 crossterm = "0.29.0"
 thiserror = "2.0.21"
 unicode-segmentation = "1.13.3"

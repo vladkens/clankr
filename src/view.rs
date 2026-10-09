@@ -3,14 +3,17 @@
 //! retain the previous footer on resize rather than guessing and erasing history.
 
 use std::io::{self, Write};
+use std::ops::Range;
 
 use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp, RestorePosition, SavePosition};
 use crossterm::queue;
 use crossterm::terminal::{Clear, ClearType};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::Res;
 use crate::input::{self, Input, Layout};
+use crate::menu::{Item, Kind, Menu, VISIBLE};
 
 pub struct Frame<'a> {
   pub input: &'a Input,
@@ -18,6 +21,8 @@ pub struct Frame<'a> {
   pub activity: Option<String>,
   pub status: String,
   pub notice: Option<&'a str>,
+  pub menu: Option<&'a Menu>,
+  pub messages: &'a [String],
 }
 
 #[derive(Default)]
@@ -65,15 +70,31 @@ struct Line {
   text: String,
   style: Style,
   origin: Origin,
+  marks: Vec<Range<usize>>,
 }
 
 impl Line {
   fn same(&self, other: &Self) -> bool {
-    self.text == other.text && self.style == other.style
+    self.text == other.text && self.style == other.style && self.marks == other.marks
   }
 
   fn write(&self, out: &mut impl Write) -> Res<()> {
     out.write_all(b"\x1b[0m")?;
+    if !self.marks.is_empty() {
+      let mut col = 0;
+      let mut bold = false;
+      for g in self.text.graphemes(true) {
+        let marked = self.marks.iter().any(|range| range.contains(&col));
+        if marked != bold {
+          out.write_all(if marked { b"\x1b[1m" } else { b"\x1b[0m" })?;
+          bold = marked;
+        }
+        out.write_all(g.as_bytes())?;
+        col += g.width();
+      }
+      out.write_all(b"\x1b[0m")?;
+      return Ok(());
+    }
     let mut text = self.text.as_str();
     if self.style == Style::Sent
       && let Some(rest) = text.strip_prefix('┃')
@@ -99,7 +120,7 @@ fn wrap(text: &str, cols: u16, first: &str, rest: &str, style: Style) -> Vec<Lin
   layout
     .rows
     .into_iter()
-    .map(|row| Line { text: row.text, end: row.end, style, origin: Origin::Transcript })
+    .map(|row| Line { text: row.text, end: row.end, style, ..Line::default() })
     .collect()
 }
 
@@ -289,6 +310,25 @@ impl Live {
     Ok(())
   }
 
+  pub fn restart(&mut self, out: &mut impl Write, rows: u16) -> Res<()> {
+    let mut bytes = Vec::new();
+    self.patch(&mut bytes, &[], (0, 0))?;
+    // Scroll completed output into native history, then start on the fresh screen.
+    // Never erase the user's terminal scrollback.
+    write!(bytes, "{}", "\r\n".repeat(usize::from(rows.max(1))))?;
+    if rows > 1 {
+      queue!(bytes, MoveUp(rows - 1))?;
+    }
+    queue!(bytes, MoveToColumn(0))?;
+    if self.redraw {
+      Origin::Transcript.write(&mut bytes)?;
+    }
+    header(&mut bytes)?;
+    update(out, bytes, self.sync)?;
+    *self = Self { sync: self.sync, redraw: self.redraw, ..Self::default() };
+    Ok(())
+  }
+
   pub fn prompt(&mut self, out: &mut impl Write, text: &str, cols: u16) -> Res<()> {
     let mut bytes = Vec::new();
     self.patch(&mut bytes, &[], (0, 0))?;
@@ -302,6 +342,20 @@ impl Live {
     self.cursor = (0, 0);
     self.frozen.clear();
     self.shown.clear();
+    Ok(())
+  }
+
+  pub fn message(&mut self, out: &mut impl Write, text: &str, cols: u16) -> Res<()> {
+    let mut bytes = Vec::new();
+    self.patch(&mut bytes, &[], (0, 0))?;
+    for line in wrap(&clean(text, 0).0, cols, "* ", "  ", Style::Plain) {
+      line.write(&mut bytes)?;
+      write!(bytes, "\r\n")?;
+    }
+    write!(bytes, "\r\n")?;
+    update(out, bytes, self.sync)?;
+    self.lines.clear();
+    self.cursor = (0, 0);
     Ok(())
   }
 
@@ -334,8 +388,15 @@ impl Live {
     let thinking = nonempty(frame.activity.as_deref());
     let active = !response.is_empty() || thinking.is_some();
     let reserve = if active && rows >= 5 { 2 } else { 0 };
-    let (footer, cursor) =
-      footer(frame.input, frame.notice, &frame.status, cols, usize::from(rows) - reserve);
+    let (footer, cursor) = footer(
+      frame.input,
+      frame.notice,
+      &frame.status,
+      frame.menu,
+      frame.messages,
+      cols,
+      usize::from(rows) - reserve,
+    );
     let budget = usize::from(rows) - footer.len();
     let mut body = Vec::new();
     let mut prefix = Vec::new();
@@ -432,6 +493,8 @@ fn footer(
   input: &Input,
   notice: Option<&str>,
   status: &str,
+  menu: Option<&Menu>,
+  messages: &[String],
   cols: u16,
   budget: usize,
 ) -> (Vec<Line>, (usize, u16)) {
@@ -439,23 +502,147 @@ fn footer(
   let cursor = layout.cursor(input.pos, input.trailing);
   let label = notice.unwrap_or(status);
   let label = clean(label, 0).0;
-  let mut status = wrap(&label, cols, "", "", Style::Plain);
-  status.truncate(usize::from(budget >= 3));
-  let gap = usize::from(!status.is_empty());
-  let count = layout.rows.len().min(budget - status.len() - gap);
-  let start = cursor.0.saturating_sub(count - 1).min(layout.rows.len() - count);
-  let mut lines: Vec<_> = layout
-    .rows
-    .into_iter()
-    .skip(start)
-    .take(count)
-    .map(|row| Line { text: row.text, ..Line::default() })
+  let menu = menu.filter(|_| notice.is_none());
+  let mut status = if let Some(menu) = menu {
+    menu_lines(menu, cols, budget.saturating_sub(1))
+  } else {
+    let mut status = wrap(&label, cols, "", "", Style::Plain);
+    status.truncate(usize::from(budget >= 3));
+    status
+  };
+  let gap = usize::from(menu.is_none() && !status.is_empty());
+  let available = budget - status.len() - gap;
+  let mut lines: Vec<_> = messages
+    .iter()
+    .flat_map(|message| wrap(&clean(message, 0).0, cols, "* ", "  ", Style::Plain))
     .collect();
+  let limit = available.saturating_sub(2);
+  if lines.len() > limit {
+    lines.drain(..lines.len() - limit);
+  }
+  if !lines.is_empty() {
+    lines.push(Line::default());
+  }
+  let lead = lines.len();
+  let count = layout.rows.len().min(available - lead);
+  let start = cursor.0.saturating_sub(count - 1).min(layout.rows.len() - count);
+  lines.extend(layout.rows.into_iter().skip(start).take(count).map(|row| {
+    let mut marks = Vec::new();
+    for skill in &input.skills {
+      let start = row.stops.iter().find(|&&(pos, _)| pos >= skill.range.start);
+      let end =
+        row.stops.iter().find(|&&(pos, _)| pos >= skill.range.end).or_else(|| row.stops.last());
+      if let (Some(&(pos, start)), Some(&(_, end))) = (start, end)
+        && pos < skill.range.end
+        && start < end
+      {
+        marks.push(usize::from(start)..usize::from(end));
+      }
+    }
+    Line { text: row.text, marks, ..Line::default() }
+  }));
   if gap > 0 {
     lines.push(Line::default());
   }
-  lines.extend(status);
-  (lines, (cursor.0 - start, cursor.1))
+  lines.append(&mut status);
+  (lines, (lead + cursor.0 - start, cursor.1))
+}
+
+fn clip(text: &str, width: usize) -> String {
+  if text.width() <= width {
+    return text.into();
+  }
+  if width == 0 {
+    return String::new();
+  }
+  let mut used = 0;
+  let mut out = String::new();
+  for g in text.graphemes(true) {
+    if used + g.width() >= width {
+      break;
+    }
+    used += g.width();
+    out.push_str(g);
+  }
+  out.push('…');
+  out
+}
+
+fn menu_lines(menu: &Menu, cols: u16, budget: usize) -> Vec<Line> {
+  if budget == 0 {
+    return Vec::new();
+  }
+  let width = usize::from(cols.saturating_sub(1).max(1));
+  let full = budget >= 6;
+  let visible = (if full { budget - 5 } else { budget }).min(VISIBLE).min(menu.items.len().max(1));
+  let start = menu.offset.min(menu.selected).max((menu.selected + 1).saturating_sub(visible));
+  let end = (start + visible).min(menu.items.len());
+  let line = |text: &str, selected| Line {
+    text: clip(text, width),
+    style: if selected { Style::Sent } else { Style::Plain },
+    ..Line::default()
+  };
+  let border = "─".repeat(width);
+  let mut lines = Vec::new();
+  if full {
+    lines.push(line(&border, false));
+    let mut title = format!("{} {}", menu.kind.title(), menu.items.len());
+    if menu.kind == Kind::Effort {
+      title.push_str(&format!(" · {}", menu.settings.model.name));
+    }
+    if menu.items.len() > visible {
+      let range = format!("{}–{end}", start + 1);
+      let gap = width.saturating_sub(title.width() + range.width());
+      if gap > 0 {
+        title.push_str(&format!("{}{range}", " ".repeat(gap)));
+      }
+    }
+    lines.push(line(&title, false));
+    lines.push(Line::default());
+  }
+  if menu.items.is_empty() {
+    let text = if menu.kind == Kind::Effort && menu.settings.model.efforts.is_empty() {
+      format!("{} has no reasoning effort.", menu.settings.model.name)
+    } else {
+      format!("No {} found.", menu.kind.title().to_lowercase())
+    };
+    lines.push(line(&text, false));
+  } else {
+    let name = |item: &Item| {
+      let mark = if Some(item.name) == menu.current() { " ✓" } else { "" };
+      format!("{}{mark}", item.name)
+    };
+    let name_width =
+      menu.items[start..end].iter().map(|item| name(item).width()).max().unwrap_or(0);
+    for (i, item) in menu.items.iter().enumerate().take(end).skip(start) {
+      let name = name(item);
+      let text = if width < 40 {
+        format!("  {name}")
+      } else {
+        let name_width = name_width.min(width / 3);
+        let name = clip(&name, name_width);
+        let source = if width >= 70 { item.source } else { "" };
+        let desc_width = width.saturating_sub(2 + name_width + 3 + source.width() + 3);
+        let desc = clip(item.description, desc_width);
+        format!(
+          "  {name}{}   {desc}{}{source}",
+          " ".repeat(name_width - name.width()),
+          " ".repeat(width.saturating_sub(2 + name_width + 3 + desc.width() + source.width()))
+        )
+      };
+      lines.push(line(&text, i == menu.selected));
+    }
+  }
+  if full {
+    lines.push(line(&border, false));
+    let hint = if matches!(menu.kind, Kind::Models | Kind::Effort) {
+      "↑↓ navigate     →/tab complete     enter apply     esc close"
+    } else {
+      "↑↓ navigate     →/tab complete     enter use     esc close"
+    };
+    lines.push(line(hint, false));
+  }
+  lines
 }
 
 #[cfg(test)]
@@ -465,7 +652,15 @@ mod tests {
   use super::*;
 
   fn frame(input: &Input) -> Frame<'_> {
-    Frame { input, response: "", activity: None, status: "echo".into(), notice: None }
+    Frame {
+      input,
+      response: "",
+      activity: None,
+      status: "echo".into(),
+      notice: None,
+      menu: None,
+      messages: &[],
+    }
   }
 
   // Small main-screen interpreter: retains scrolled rows, clamps cursor movement to the screen,
@@ -687,6 +882,42 @@ mod tests {
   }
 
   #[test]
+  fn picker_resize_preserves_history_and_selected_skill_styles_use_default_colours() {
+    let mut live = Live { redraw: true, sync: true, ..Live::default() };
+    let mut screen = Screen::new(24);
+    apply(&mut screen, |out| {
+      live.prompt(out, "HISTORY", 80).unwrap();
+      live.finish(out, "reply", None, 80).unwrap();
+    });
+    let mut input = Input::default();
+    input.insert("before $").unwrap();
+    let mut menu = Menu::open(&input, crate::model::Settings::default()).unwrap();
+    for _ in 0..7 {
+      menu.step(true);
+    }
+    for (cols, rows) in [(80, 24), (40, 12), (8, 5), (2, 2), (1, 1), (119, 53)] {
+      screen.resize(cols, rows);
+      live.resize();
+      let frame = Frame { menu: Some(&menu), ..frame(&input) };
+      let delta = apply(&mut screen, |out| live.draw(out, &frame, cols, rows as u16).unwrap());
+      assert!(!delta.contains("HISTORY"));
+      assert!(screen.col < usize::from(cols));
+      assert!(screen.row >= screen.top && screen.row < screen.top + rows);
+    }
+    menu.choose(&mut input, false).unwrap();
+    let delta = apply(&mut screen, |out| live.draw(out, &frame(&input), 119, 53).unwrap());
+    assert!(delta.contains("\x1b[1m$planning\x1b[0m"));
+    assert!(!screen.text().contains("Skills 8"));
+    assert!(screen.text().contains("before $planning"));
+    apply(&mut screen, |out| live.restart(out, 53).unwrap());
+    input = Input::default();
+    apply(&mut screen, |out| live.draw(out, &frame(&input), 119, 53).unwrap());
+    assert_eq!(screen.text().matches("HISTORY").count(), 1);
+    assert_eq!(screen.text().matches("reply").count(), 1);
+    assert_eq!(screen.lines[screen.top], "clankr v0.1.0");
+  }
+
+  #[test]
   fn completed_turns_survive_scrolling_and_cursor_moves_do_not_redraw_text() {
     let mut live = Live { redraw: true, sync: true, ..Live::default() };
     let mut screen = Screen::new(8);
@@ -746,7 +977,7 @@ mod tests {
       input.pos = pos;
       for cols in [1, 2, 3, 8, 40, 119] {
         for rows in [1, 2, 3, 12, 53] {
-          let (lines, cursor) = footer(&input, None, "echo", cols, rows);
+          let (lines, cursor) = footer(&input, None, "echo", None, &[], cols, rows);
           assert!(lines.len() <= rows);
           assert!(cursor.0 < lines.len() && cursor.1 < cols);
           assert!(lines.iter().all(|line| line.text.width() <= usize::from(cols)));
@@ -785,6 +1016,7 @@ mod tests {
     let mut input = Input::default();
     input.insert("next draft\nwith another line").unwrap();
     let mut response = String::new();
+    let messages = ["Copied to clipboard.".to_owned()];
     let (mut cols, mut rows) = (80, 12);
     apply(&mut screen, |out| live.prompt(out, "original question", cols).unwrap());
     let waiting = Frame { activity: Some("• Thinking".into()), ..frame(&input) };
@@ -797,10 +1029,19 @@ mod tests {
         screen.resize(cols, usize::from(rows));
         live.resize();
       }
-      let frame = Frame { response: &response, ..frame(&input) };
+      let frame = Frame {
+        response: &response,
+        messages: if index >= 20 { &messages } else { &[] },
+        ..frame(&input)
+      };
       apply(&mut screen, |out| live.draw(out, &frame, cols, rows).unwrap());
+      if index >= 20 {
+        assert!(screen.text().contains("* Copied to clipboard."));
+        assert!(screen.text().ends_with("echo"));
+      }
     }
     apply(&mut screen, |out| live.finish(out, &response, None, cols).unwrap());
+    apply(&mut screen, |out| live.message(out, &messages[0], cols).unwrap());
     apply(&mut screen, |out| live.draw(out, &frame(&input), cols, rows).unwrap());
     let text = screen.text();
     assert_eq!(text.matches("original question").count(), 1);
@@ -808,6 +1049,9 @@ mod tests {
       assert_eq!(text.matches(&format!("line-{index:03}")).count(), 1);
     }
     assert_eq!(text.matches("next draft").count(), 1);
+    assert_eq!(text.matches("* Copied to clipboard.").count(), 1);
+    assert!(text.find("line-099").unwrap() < text.find("* Copied to clipboard.").unwrap());
+    assert!(text.find("* Copied to clipboard.").unwrap() < text.find("next draft").unwrap());
     assert_eq!(input.text, "next draft\nwith another line");
   }
 }

@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as Mods};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -48,7 +50,7 @@ pub struct Row {
   pub text: String,
   // Exclusive source offset, including a consumed newline, for streaming output.
   pub end: usize,
-  stops: Vec<(usize, u16)>,
+  pub stops: Vec<(usize, u16)>,
 }
 
 pub struct Layout {
@@ -135,20 +137,61 @@ pub struct Input {
   pub text: String,
   pub pos: usize,
   pub trailing: bool,
+  pub skills: Vec<Mention>,
   column: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mention {
+  pub range: Range<usize>,
+  pub name: String,
 }
 
 impl Input {
   pub fn insert(&mut self, value: &str) -> Res<()> {
-    if value.len() > LIMIT.saturating_sub(self.text.len()) {
+    self.replace(self.pos..self.pos, value)
+  }
+
+  pub fn replace(&mut self, mut range: Range<usize>, value: &str) -> Res<()> {
+    // Picked skills are atomic on deletion; pasted lookalikes remain ordinary text.
+    if !range.is_empty() {
+      for skill in &self.skills {
+        if range.start < skill.range.end && skill.range.start < range.end {
+          range.start = range.start.min(skill.range.start);
+          range.end = range.end.max(skill.range.end);
+        }
+      }
+    }
+    if value.len() > LIMIT.saturating_sub(self.text.len() - range.len()) {
       return Err(Error::InputTooLarge);
     }
     let value = clean(value, 0, false).0;
-    self.text.insert_str(self.pos, &value);
-    self.pos += value.len();
+    self.skills.retain_mut(|skill| {
+      if skill.range.end <= range.start {
+        return true;
+      }
+      if skill.range.start >= range.end {
+        skill.range.start = skill.range.start - range.len() + value.len();
+        skill.range.end = skill.range.end - range.len() + value.len();
+        return true;
+      }
+      false
+    });
+    self.text.replace_range(range.clone(), &value);
+    self.pos = range.start + value.len();
     self.snap();
     self.column = None;
     self.trailing = false;
+    Ok(())
+  }
+
+  pub fn mention(&mut self, range: Range<usize>, name: &str) -> Res<()> {
+    let start = range.start;
+    let token = format!("${name}");
+    let space = self.text[range.end..].chars().next().is_none_or(|c| !c.is_whitespace());
+    self.replace(range, &format!("{token}{}", if space { " " } else { "" }))?;
+    self.skills.push(Mention { range: start..start + token.len(), name: name.into() });
+    self.skills.sort_by_key(|skill| skill.range.start);
     Ok(())
   }
 
@@ -256,9 +299,7 @@ impl Input {
           range.end += 1;
         }
       }
-      self.pos = range.start;
-      self.text.drain(range);
-      self.snap();
+      self.replace(range, "")?;
       return Ok(true);
     }
     match key.code {
@@ -268,18 +309,16 @@ impl Input {
       KeyCode::Char('f') if alt => self.pos = self.word(false),
       KeyCode::Backspace => {
         let start = if alt { self.word(true) } else { prev };
-        self.text.drain(start..self.pos);
-        self.pos = start;
+        self.replace(start..self.pos, "")?;
       }
       KeyCode::Delete => {
-        self.text.drain(self.pos..next);
+        self.replace(self.pos..next, "")?;
       }
       KeyCode::Char('a') if ctrl => self.pos = start,
       KeyCode::Char('e') if ctrl => self.pos = end,
       KeyCode::Char('w') if ctrl => {
         let start = self.word(true);
-        self.text.drain(start..self.pos);
-        self.pos = start;
+        self.replace(start..self.pos, "")?;
       }
       _ => {}
     }
@@ -291,6 +330,58 @@ impl Input {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn picked_skills_delete_atomically_and_pasted_names_remain_plain_text() {
+    for (code, mods) in [
+      (KeyCode::Backspace, Mods::NONE),
+      (KeyCode::Backspace, Mods::ALT),
+      (KeyCode::Char('w'), Mods::CONTROL),
+    ] {
+      let mut dat = input("huj! $age");
+      dat.mention(5..9, "agent-rules").unwrap();
+      assert_eq!(dat.text, "huj! $agent-rules ");
+      if mods == Mods::NONE {
+        dat.edit(key(KeyCode::Backspace), 80).unwrap();
+      }
+      dat.edit(KeyEvent::new(code, mods), 80).unwrap();
+      assert_eq!(dat.text, "huj! ");
+      assert!(dat.skills.is_empty());
+    }
+    let mut dat = input("$age after");
+    dat.mention(0..4, "agent-rules").unwrap();
+    dat.pos = 0;
+    dat.edit(key(KeyCode::Delete), 80).unwrap();
+    assert_eq!(dat.text, " after");
+    assert!(dat.skills.is_empty());
+    let mut dat = input("copy paste $agent-rules");
+    dat.edit(key(KeyCode::Backspace), 80).unwrap();
+    assert_eq!(dat.text, "copy paste $agent-rule");
+    assert!(dat.skills.is_empty());
+  }
+
+  #[test]
+  fn selected_ranges_follow_unicode_edits_and_preserve_neighbouring_mentions() {
+    let mut dat = input("$ag");
+    dat.mention(0..3, "agent-rules").unwrap();
+    let start = dat.pos;
+    dat.insert("$ru").unwrap();
+    dat.mention(start..dat.pos, "code-style-rust").unwrap();
+    dat.pos = 0;
+    dat.insert("界\n").unwrap();
+    for skill in &dat.skills {
+      assert_eq!(&dat.text[skill.range.clone()], format!("${}", skill.name));
+    }
+    dat.pos = dat.skills[0].range.start + 3;
+    dat.edit(key(KeyCode::Delete), 80).unwrap();
+    assert_eq!(dat.text, "界\n $code-style-rust ");
+    assert_eq!(dat.skills.len(), 1);
+    assert_eq!(&dat.text[dat.skills[0].range.clone()], "$code-style-rust");
+    dat.pos = dat.text.len();
+    dat.edit(KeyEvent::new(KeyCode::Backspace, Mods::SUPER), 80).unwrap();
+    assert_eq!(dat.text, "界\n");
+    assert!(dat.skills.is_empty());
+  }
 
   fn input(text: &str) -> Input {
     let mut input = Input::default();

@@ -238,12 +238,20 @@ class Terminal:
     def paste(self, value):
         self.send(ESC + "[200~" + value + ESC + "[201~")
 
-    def submit(self, expected):
+    def menu(self, title):
+        self.until(lambda: title in self.display and "esc close" in self.display
+                   and self.screen.display[self.screen.cursor.y].startswith("┃"), title)
+
+    def submit(self, expected, model="echo"):
         start = len(self.output)
         self.send("\r")
-        self.until(lambda: SUMMARY.search(self.output[start:])
-                   and self.screen.display[self.screen.cursor.y].strip() == "┃",
-                   f"echo of {expected!r}")
+
+        def completed():
+            match = SUMMARY.search(self.output[start:])
+            return (match and ESC + "[0mauto · " + model in self.output[start + match.end():]
+                    and self.screen.display[self.screen.cursor.y].strip() == "┃")
+
+        self.until(completed, f"echo of {expected!r}")
         summary = SUMMARY.search(self.output[start:])[1]
         rows = self.transcript.splitlines()
         end = max(i for i, row in enumerate(rows) if row == "  " + summary) - 1
@@ -286,11 +294,11 @@ class Terminal:
         try:
             if self.proc.poll() is None:
                 os.killpg(self.proc.pid, signal.SIGKILL)
-                self.proc.wait(timeout=2)
         finally:
             for fd in (self.master, self.slave, self.notify, self.release):
                 os.close(fd)
             self.temp.cleanup()
+        self.proc.wait(timeout=5)
 
 
 def tui(binary):
@@ -404,7 +412,8 @@ def mock_lifecycle(binary):
         terminal.until(lambda: "(↑1 ↓1)" in terminal.display, "live token counter")
         require("┃ next draft" in terminal.display, "Generation swallowed the next draft")
         require("  hi!" not in terminal.display, "Short echo should follow the generating phase")
-        terminal.until(lambda: SUMMARY.search(terminal.output[start:]), "final mock statistics")
+        terminal.until(lambda: SUMMARY.search(terminal.output[start:])
+                       and "2/272k 0%" in terminal.display, "final mock statistics and status")
         require("(↑1 ↓1)" in SUMMARY.search(terminal.output[start:])[1], "Wrong final counts")
         require("  hi!" in terminal.display and "┃ next draft" in terminal.display,
                 "Final answer or next draft lost")
@@ -440,12 +449,236 @@ def mock_lifecycle(binary):
         terminal.close()
 
 
+def menus(binary):
+    terminal = Terminal(binary)
+    try:
+        terminal.ready()
+        terminal.send("/copy\r")
+        terminal.until(lambda: "* No assistant reply to copy." in terminal.display
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃"
+                       and "auto · echo · medium" in terminal.display, "copy message above the editor")
+        message_row = next(i for i, row in enumerate(terminal.screen.display)
+                           if row.startswith("* No assistant reply to copy."))
+        require(message_row < terminal.screen.cursor.y, "Clipboard feedback replaced the status")
+        terminal.send("draft")
+        terminal.until(lambda: "┃ draft" in terminal.display, "typing after copy feedback")
+        require("* No assistant reply to copy." in terminal.display,
+                "Clipboard feedback disappeared from history")
+        terminal.exit("\x03")
+        require("again to exit" not in terminal.output, "Empty session asked for exit confirmation")
+    finally:
+        terminal.close()
+
+    terminal = Terminal(binary)
+    try:
+        terminal.ready()
+        terminal.send("/")
+        terminal.menu("Commands 6")
+        require("/clear" in terminal.display and "/quit" in terminal.display, "Missing commands")
+        require("/fast" in terminal.display and "/copy" in terminal.display, "Missing fast/copy commands")
+        require("/help" not in terminal.display and "agent-rules" not in terminal.display,
+                "Slash menu must contain commands only, without help")
+        require(terminal.screen.display[2].rstrip() == "┃ /", "Menu moved above the editor")
+        require(terminal.screen.display[3].startswith("─"), "Missing menu divider")
+        terminal.send("cl" + RIGHT)
+        terminal.until(lambda: "Commands" not in terminal.display and "┃ /clear" in terminal.display,
+                       "Right completes the command without running it")
+        terminal.send("\r")
+        terminal.until(lambda: terminal.screen.display[0].startswith("clankr v")
+                       and terminal.screen.display[2].rstrip() == "┃", "clear command")
+
+        terminal.send("huj! $age")
+        terminal.menu("Skills 3")
+        require("agent-rules" in terminal.display and "/clear" not in terminal.display,
+                "Dollar picker must contain skills only")
+        terminal.send(DOWN + RIGHT)
+        terminal.until(lambda: "Skills" not in terminal.display
+                       and "┃ huj! $agent-rules" in terminal.display, "Right completes the picked skill")
+        row = terminal.screen.cursor.y
+        require(terminal.screen.buffer[row][7].bold, "Picked skill must be visually distinct")
+        terminal.send("yes")
+        terminal.until(lambda: "┃ huj! $agent-rules yes" in terminal.display, "typing after a skill")
+        terminal.send("\x7f" * 5)
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃ huj!",
+                       "whole skill deletion")
+        terminal.send("\x15")
+        terminal.paste("copy paste $agent-rules? 1221e")
+        terminal.until(lambda: "copy paste $agent-rules? 1221e" in terminal.display, "literal paste")
+        require("Skills" not in terminal.display, "Paste unexpectedly opened the skill picker")
+        row = terminal.screen.cursor.y
+        require(not any(cell.bold for cell in terminal.screen.buffer[row].values()),
+                "Pasted skill name was activated")
+        terminal.send("\x15")
+        terminal.paste("$agent-rules")
+        terminal.send("\x7f")
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃ $agent-rule",
+                       "pasted names delete as ordinary text")
+        terminal.send("\x15$")
+        terminal.menu("Skills 8")
+        terminal.send(DOWN * 7)
+        terminal.until(lambda: "3–8" in terminal.display, "skill list scrolling")
+        terminal.send(DOWN)
+        terminal.until(lambda: "1–6" in terminal.display, "Down wraps to the first skill")
+        terminal.send(UP)
+        terminal.until(lambda: "3–8" in terminal.display, "Up wraps to the last skill")
+        for cols, rows in ((40, 12), (2, 2), (1, 1), (119, 53)):
+            terminal.resize(cols, rows)
+        terminal.send("\t")
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃ $planning",
+                       "Tab chooses the skill after resize")
+        terminal.send("\x15$zzzz")
+        terminal.until(lambda: "No skills found." in terminal.display, "empty result")
+        terminal.send("\r")
+        terminal.send(ESC)
+        terminal.until(lambda: terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃ $zzzz"
+                       and "No skills found." not in terminal.display, "Esc preserves the draft")
+        terminal.send("\x15")
+        terminal.paste("HISTORY-SEED")
+        terminal.submit("HISTORY-SEED")
+        terminal.send("/cl\r")
+        terminal.until(lambda: terminal.screen.display[0].startswith("clankr v")
+                       and terminal.screen.display[2].rstrip() == "┃"
+                       and "HISTORY-SEED" not in terminal.display, "fresh screen")
+        require(terminal.transcript.count("HISTORY-SEED") == 2, "Clear destroyed native scrollback")
+        require("/272k" not in terminal.display, "Clear did not reset mock context")
+
+        for phase in ("Thinking", "Generating"):
+            terminal.paste("cancel current")
+            terminal.send("\r")
+            terminal.until(lambda: phase in terminal.display, f"Ctrl+C during {phase}")
+            terminal.paste("next draft")
+            start = len(terminal.output)
+            terminal.send("\x03")
+            terminal.until(lambda: "Cancelled ·" in terminal.output[start:], "Ctrl+C cancellation")
+            require("again to exit" not in terminal.output[start:], "Active Ctrl+C offered to close the session")
+            require("┃ next draft" in terminal.display, "Ctrl+C lost the next draft")
+            terminal.send("\x15")
+
+        terminal.paste("old pending")
+        terminal.send("\r")
+        terminal.until(lambda: "Thinking" in terminal.display, "active clear request")
+        terminal.send("$")
+        terminal.menu("Skills 8")
+        terminal.send(ESC)
+        terminal.until(lambda: "Skills 8" not in terminal.display, "close picker while active")
+        require("Thinking" in terminal.display, "Esc closed the request instead of the picker")
+        terminal.send("\x15/cl\r")
+        terminal.until(lambda: terminal.screen.display[0].startswith("clankr v")
+                       and terminal.screen.display[2].rstrip() == "┃"
+                       and "Thinking" not in terminal.display, "clear while active")
+        terminal.paste("new conversation")
+        terminal.submit("new conversation")
+        require("old pending" not in terminal.display, "Old request reappeared after clear")
+        terminal.send("\x03")
+        terminal.until(lambda: "press ctrl+c again to exit" in terminal.display,
+                       "Existing session asks for exit confirmation")
+        terminal.send("/clear\r")
+        terminal.until(lambda: terminal.screen.display[0].startswith("clankr v")
+                       and terminal.screen.display[2].rstrip() == "┃"
+                       and "/272k" not in terminal.display, "clear before exit")
+        start = len(terminal.output)
+        terminal.exit("\x03")
+        require("again to exit" not in terminal.output[start:],
+                "Cleared session asked for exit confirmation")
+    finally:
+        terminal.close()
+    print("PASS menus: separate slash/dollar pickers, filtering, scroll, completion, atomic skill deletion, literal paste, resize, clear, active Ctrl+C, session exit")
+
+
+def models(binary):
+    terminal = Terminal(binary)
+    lower, higher = ESC + "[44;5u", ESC + "[46;5u"
+
+    def selected(value):
+        terminal.until(lambda: "auto · " + value in terminal.display
+                       and "esc close" not in terminal.display
+                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "┃",
+                       "selected " + value)
+
+    try:
+        terminal.ready()
+        terminal.send("/fast" + RIGHT)
+        terminal.until(lambda: "┃ /fast" in terminal.display and "⚡" in terminal.display
+                       and "esc close" not in terminal.display, "Fast completion does not toggle")
+        terminal.send("\r")
+        selected("echo · medium")
+        terminal.until(lambda: "⚡" not in terminal.display, "Fast off")
+        terminal.send("/fast\r")
+        selected("echo · medium · ⚡")
+        terminal.send("/model\r")
+        terminal.menu("Models 7")
+        require("echo ✓" in terminal.display, "Missing current model marker")
+        terminal.send(UP)
+        terminal.until(lambda: "2–7" in terminal.display, "Up wraps to the last model")
+        terminal.send(DOWN)
+        terminal.until(lambda: "1–6" in terminal.display, "Down wraps to the first model")
+        for cols, rows in ((40, 12), (1, 1), (119, 53)):
+            terminal.resize(cols, rows)
+        terminal.send("gpt-6.1" + RIGHT)
+        terminal.until(lambda: "┃ /model gpt-6.1-sol" in terminal.display
+                       and "auto · echo · medium" in terminal.display, "model completion without applying")
+        terminal.send("\r")
+        selected("gpt-6.1-sol · medium · ⚡")
+        terminal.send(higher)
+        selected("gpt-6.1-sol · high")
+        terminal.send(lower)
+        selected("gpt-6.1-sol · medium")
+        terminal.send(higher * 10)
+        selected("gpt-6.1-sol · ultra")
+        terminal.send("/effort\r")
+        terminal.menu("Effort 6 · gpt-6.1-sol")
+        require("ultra ✓" in terminal.display, "Missing current effort marker")
+        terminal.send(DOWN + "\r")
+        selected("gpt-6.1-sol · low")
+
+        terminal.send("/model opus")
+        terminal.menu("Models 1")
+        terminal.send(ESC)
+        terminal.until(lambda: "auto · gpt-6.1-sol · low" in terminal.display
+                       and "┃ /model opus" in terminal.display, "Esc discards model selection")
+        terminal.send("\x15/effort high\r")
+        selected("gpt-6.1-sol · high")
+        terminal.send("/model sonnet\r")
+        selected("sonnet · high")
+        require("⚡" not in terminal.display, "Unsupported speed was kept")
+        terminal.send("/model opus\r")
+        selected("opus · high")
+        terminal.send(higher)
+        selected("opus · xhigh")
+        terminal.send("/model sonnet\r")
+        selected("sonnet · medium")
+
+        terminal.send("/model haiku\r")
+        selected("haiku")
+        terminal.send("/effort\r")
+        terminal.menu("Effort 0 · haiku")
+        require("haiku has no reasoning effort." in terminal.display,
+                "Missing explanation for a model without effort")
+        terminal.send(lower + higher + "\r" + ESC)
+        terminal.until(lambda: "auto · haiku" in terminal.display
+                       and "┃ /effort" in terminal.display, "Unsupported effort stays unset")
+        terminal.send("\x15/model opus\r")
+        selected("opus · xhigh")
+        terminal.send(",.")
+        terminal.until(lambda: "┃ ,." in terminal.display, "Plain punctuation still edits the draft")
+        terminal.send("\x15")
+        terminal.paste("selected model echo")
+        terminal.submit("selected model echo", model="opus")
+        terminal.send("/clear\r")
+        selected("opus · xhigh")
+        terminal.until(lambda: "/272k" not in terminal.display, "Clear preserves settings and resets context")
+        terminal.exit("\x03")
+    finally:
+        terminal.close()
+    print("PASS models: separate model/effort lists, completion, cancel, cyclic navigation, resize, current markers, compatible settings, default fallback, Ctrl+,/Ctrl+., echo, clear")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
-    parser.add_argument("--case", choices=["tui"], required=True)
+    parser.add_argument("--case", choices=["tui", "menus", "models"], required=True)
     args = parser.parse_args()
-    tui(args.bin.resolve(strict=True))
+    {"tui": tui, "menus": menus, "models": models}[args.case](args.bin.resolve(strict=True))
 
 
 if __name__ == "__main__":

@@ -1,8 +1,28 @@
 use std::time::{Duration, Instant};
 
+use crate::model::Settings;
 use crate::{Error, Res};
 
 pub const LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Prompt {
+  pub text: String,
+  pub skills: Vec<String>,
+  pub settings: Settings,
+}
+
+impl From<String> for Prompt {
+  fn from(text: String) -> Self {
+    Self { text, skills: Vec::new(), settings: Settings::default() }
+  }
+}
+
+impl From<&str> for Prompt {
+  fn from(text: &str) -> Self {
+    text.to_owned().into()
+  }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage {
@@ -19,9 +39,6 @@ pub enum Phase {
 
 pub struct Status<'a> {
   pub mode: &'a str,
-  pub model: &'a str,
-  pub effort: &'a str,
-  pub fast: bool,
   pub context: Option<(u64, u64)>,
 }
 
@@ -38,9 +55,11 @@ pub enum Event {
 // and must stop it when dropped; it never writes to the terminal.
 pub trait Backend {
   fn status(&self) -> Status<'_>;
-  fn start(&mut self, prompt: String);
+  fn start(&mut self, prompt: Prompt);
   fn poll(&mut self) -> Option<Event>;
   fn cancel(&mut self);
+  // Stop the current request, discard its events, and reset conversation context.
+  fn reset(&mut self);
 }
 
 #[derive(Default)]
@@ -52,8 +71,9 @@ pub struct Echo {
 }
 
 struct Reply {
-  text: String,
+  prompt: Prompt,
   usage: Usage,
+  total: u64,
   phase: Phase,
   sent: bool,
   next: Instant,
@@ -61,13 +81,16 @@ struct Reply {
 }
 
 impl Echo {
-  fn start_at(&mut self, prompt: String, now: Instant) {
+  fn start_at(&mut self, prompt: Prompt, now: Instant) {
     // Mock token counts and latency exercise the same UI events as a real backend.
-    let input = prompt.chars().count().div_ceil(4) as u64;
+    let total = prompt.text.chars().count().div_ceil(4) as u64;
+    let input =
+      total + prompt.skills.iter().map(|name| name.chars().count().div_ceil(4) as u64).sum::<u64>();
     let usage = Usage { input, output: 0 };
     self.reply = Some(Reply {
-      text: prompt,
+      prompt,
       usage,
+      total,
       phase: Phase::Thinking,
       sent: false,
       next: now + Duration::from_millis(1200),
@@ -93,18 +116,17 @@ impl Echo {
       reply.next = now + Duration::from_millis(50);
       return Some(Event::Phase(Phase::Generating));
     }
-    if reply.usage.output < reply.usage.input {
-      reply.usage.output =
-        (reply.usage.output + reply.usage.input.div_ceil(12)).min(reply.usage.input);
+    if reply.usage.output < reply.total {
+      reply.usage.output = (reply.usage.output + reply.total.div_ceil(12)).min(reply.total);
       reply.next = now + Duration::from_millis(50);
-      if reply.usage.output == reply.usage.input {
+      if reply.usage.output == reply.total {
         reply.next = reply.next.max(reply.finish);
       }
       return Some(Event::Usage(reply.usage));
     }
     if !reply.sent {
       reply.sent = true;
-      return Some(Event::Text(std::mem::take(&mut reply.text)));
+      return Some(Event::Text(std::mem::take(&mut reply.prompt.text)));
     }
     self.context += reply.usage.input + reply.usage.output;
     self.reply = None;
@@ -114,16 +136,10 @@ impl Echo {
 
 impl Backend for Echo {
   fn status(&self) -> Status<'_> {
-    Status {
-      mode: "auto",
-      model: "echo",
-      effort: "medium",
-      fast: true,
-      context: (self.context > 0).then_some((self.context, 272_000)),
-    }
+    Status { mode: "auto", context: (self.context > 0).then_some((self.context, 272_000)) }
   }
 
-  fn start(&mut self, prompt: String) {
+  fn start(&mut self, prompt: Prompt) {
     self.start_at(prompt, Instant::now());
   }
 
@@ -136,6 +152,10 @@ impl Backend for Echo {
       self.usage = None;
       self.cancelled = true;
     }
+  }
+
+  fn reset(&mut self) {
+    *self = Self::default();
   }
 }
 
@@ -196,6 +216,9 @@ mod tests {
       assert!(echo.poll_at(now + Duration::from_secs(5)).is_none());
       echo.start_at("next".into(), now);
       assert!(matches!(echo.poll_at(now), Some(Event::Usage(_))));
+      echo.reset();
+      assert!(echo.poll_at(now + Duration::from_secs(5)).is_none());
+      assert!(echo.status().context.is_none());
     }
   }
 }

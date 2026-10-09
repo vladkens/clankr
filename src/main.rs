@@ -1,6 +1,8 @@
 mod agent;
 mod chat;
 mod input;
+mod menu;
+mod model;
 mod view;
 
 type Res<T> = Result<T, Error>;
@@ -9,6 +11,8 @@ type Res<T> = Result<T, Error>;
 enum Error {
   #[error(transparent)]
   Io(#[from] std::io::Error),
+  #[error(transparent)]
+  Clipboard(#[from] arboard::Error),
   #[error("clankr needs a terminal")]
   NotTerminal,
   #[error("Keyboard is already active")]
