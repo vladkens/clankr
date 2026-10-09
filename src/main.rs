@@ -5,6 +5,7 @@ mod markdown;
 mod math;
 mod menu;
 mod model;
+mod syntax;
 mod view;
 
 type Res<T> = Result<T, Error>;

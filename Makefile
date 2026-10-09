@@ -1,4 +1,4 @@
-.PHONY: prepare check test build update clean run
+.PHONY: prepare check test test-cli build update clean run
 
 CARGO_FLAGS := --release --locked
 
@@ -14,6 +14,10 @@ check:
 
 test:
 	cargo test $(CARGO_FLAGS)
+
+test-cli:
+	cargo build $(CARGO_FLAGS)
+	uv run tests/cli.py --bin target/release/clankr $(if $(CASE),--case $(CASE))
 
 build:
 	cargo build $(CARGO_FLAGS)

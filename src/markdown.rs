@@ -1,21 +1,16 @@
 use std::io::Write;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossterm::queue;
 use crossterm::style::{Attribute, SetAttribute};
 use mdtext::{Alignment, Event, ListKind, Options, Parser, Tag};
 use osc8::Hyperlink;
-use syntect::highlighting::{
-  Color, FontStyle, HighlightState, Highlighter, RangedHighlightIterator, StyleModifier, Theme,
-  ThemeItem,
-};
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
+use crate::syntax::Code;
 use crate::{Res, input};
 
 // Classic SGR foregrounds use the terminal's own palette, so printed history follows theme changes.
@@ -47,6 +42,19 @@ impl Style {
     Self { colour: Some(colour), ..self }
   }
 
+  fn syntax(self, scope: &str) -> Self {
+    match scope {
+      "comment" => self.with(Self::FAINT | Self::ITALIC),
+      "keyword" => self.colour(MAGENTA),
+      "string" | "character" | "diff.plus" => self.colour(GREEN),
+      "diff.minus" => self.colour(RED),
+      "number" | "float" | "boolean" | "constant" => self.colour(YELLOW),
+      "function" => self.colour(BLUE),
+      "type" | "constructor" | "namespace" => self.colour(CYAN),
+      _ => self,
+    }
+  }
+
   pub fn write(self, out: &mut impl Write) -> Res<()> {
     queue!(out, SetAttribute(Attribute::Reset))?;
     for (flag, attr) in [
@@ -64,79 +72,6 @@ impl Style {
       write!(out, "\x1b[{colour}m")?;
     }
     Ok(())
-  }
-}
-
-// Loaded on the first fenced block with a language; bat's set adds TypeScript, TOML and others.
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
-
-// A theme only selects scopes: red carries the SGR colour code, 0 keeps the default foreground.
-// Italic is reserved for comments, which render faint and italic.
-static THEME: LazyLock<Theme> = LazyLock::new(|| {
-  let item = |scope: &str, code: u8, font_style| ThemeItem {
-    scope: scope.parse().unwrap(),
-    style: StyleModifier {
-      foreground: Some(Color { r: code, g: 0, b: 0, a: 0 }),
-      background: None,
-      font_style,
-    },
-  };
-  let mut scopes = vec![item("comment", 0, Some(FontStyle::ITALIC))];
-  scopes.extend(
-    [
-      ("keyword, storage, keyword.operator.word", MAGENTA),
-      ("keyword.operator", 0),
-      ("string, markup.inserted", GREEN),
-      ("markup.deleted", RED),
-      ("constant.numeric, constant.language", YELLOW),
-      ("entity.name.function, support.function, support.macro, variable.function", BLUE),
-      (
-        "entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, \
-        entity.name.trait, entity.name.interface, entity.other.inherited-class, support.type, \
-        support.class",
-        CYAN,
-      ),
-    ]
-    .map(|(scope, code)| item(scope, code, None)),
-  );
-  Theme { scopes, ..Theme::default() }
-});
-
-static HIGHLIGHTER: LazyLock<Highlighter<'static>> = LazyLock::new(|| Highlighter::new(&THEME));
-
-// Parser state carries multi-line comments and strings from one code line to the next.
-#[derive(Clone)]
-struct Code {
-  parse: ParseState,
-  highlight: HighlightState,
-}
-
-impl Code {
-  fn new(lang: &str) -> Option<Self> {
-    let syntax = SYNTAXES.find_syntax_by_token(lang)?;
-    Some(Self {
-      parse: ParseState::new(syntax),
-      highlight: HighlightState::new(&HIGHLIGHTER, ScopeStack::new()),
-    })
-  }
-
-  fn line(&mut self, line: &str, base: Style) -> Option<Vec<(Style, Range<usize>)>> {
-    let ops = self.parse.parse_line(line, &SYNTAXES).ok()?;
-    let parts = RangedHighlightIterator::new(&mut self.highlight, &ops, line, &HIGHLIGHTER);
-    Some(
-      parts
-        .map(|(style, _, range)| {
-          let mut out = base;
-          if style.foreground.r != 0 {
-            out = out.colour(style.foreground.r);
-          }
-          if style.font_style.contains(FontStyle::ITALIC) {
-            out = out.with(Style::FAINT | Style::ITALIC);
-          }
-          (out, range)
-        })
-        .collect(),
-    )
   }
 }
 
@@ -322,10 +257,10 @@ impl Render {
         self.push(line);
         continue;
       }
-      match self.code.as_mut().and_then(|code| code.line(line, style)) {
+      match self.code.as_mut().and_then(|code| code.line(line)) {
         Some(parts) => {
           for (part, range) in parts {
-            self.style = part;
+            self.style = style.syntax(part);
             self.push(&line[range]);
           }
           self.style = style;
@@ -866,7 +801,7 @@ mod tests {
     );
     assert_eq!(styled(&text, "fn"), [("fn", colour(MAGENTA))]);
     assert_eq!(styled(&text, "main"), [("main", colour(BLUE))]);
-    assert_eq!(styled(&text, "// note"), [("// note\n", comment)]);
+    assert_eq!(styled(&text, "// note"), [("// note", comment)]);
     assert_eq!(styled(&text, "hi"), [("\"hi\"", colour(GREEN))]);
     assert_eq!(styled(&text, "42"), [("42", colour(YELLOW))]);
     assert_eq!(styled(&text, "true"), [("true", colour(YELLOW))]);
@@ -880,7 +815,7 @@ mod tests {
     assert_eq!(styled(&text, "def"), [("def", colour(MAGENTA))]);
     assert_eq!(styled(&text, "greet"), [("greet", colour(BLUE))]);
     assert_eq!(styled(&text, "str"), [("str", colour(CYAN))]);
-    assert_eq!(styled(&text, "# note"), [("# note\n", comment)]);
+    assert_eq!(styled(&text, "# note"), [("# note", comment)]);
     assert_eq!(styled(&text, "return"), [("return", colour(MAGENTA))]);
     assert_eq!(styled(&text, "42"), [("42", colour(YELLOW))]);
     assert_eq!(styled(&text, "None"), [("None", colour(YELLOW))]);
@@ -894,8 +829,8 @@ mod tests {
     assert_eq!(styled(&text, "const"), [("const", colour(MAGENTA))]);
     assert_eq!(styled(&text, "number"), [("number", colour(CYAN))]);
     let text = render("```diff\n-old\n+new\n```");
-    assert_eq!(styled(&text, "old"), [("-old\n", colour(RED))]);
-    assert_eq!(styled(&text, "new"), [("+new\n", colour(GREEN))]);
+    assert_eq!(styled(&text, "old"), [("-old", colour(RED))]);
+    assert_eq!(styled(&text, "new"), [("+new", colour(GREEN))]);
 
     for source in ["```robotlang\nfn \"x\" 42\n```", "```\nfn \"x\" 42\n```", "    fn \"x\" 42"] {
       let text = render(source);
@@ -946,6 +881,21 @@ mod tests {
     let text = render("```python\nx = \"\"\"doc\nstring\"\"\"\ny = 1\n```");
     assert_eq!(styled(&text, "doc"), [("\"\"\"doc\nstring\"\"\"", green)]);
     assert_eq!(styled(&text, "1"), [("1", Style::default().colour(YELLOW))]);
+  }
+
+  #[test]
+  fn unfinished_tokens_keep_their_style_without_leaking_out_of_injected_code() {
+    let text =
+      render("```rust\nfn main() {\n  /* open\n  still */ let s = \"/* literal */\";\n}\n```");
+    let comment = Style::default().with(Style::FAINT | Style::ITALIC);
+    assert_eq!(styled(&text, "main"), [("main", Style::default().colour(BLUE))]);
+    assert_eq!(styled(&text, "open"), [("/* open\n  still */", comment)]);
+    assert_eq!(styled(&text, "literal"), [("\"/* literal */\"", Style::default().colour(GREEN))]);
+
+    let text = render("````markdown\n```rust\n/* unfinished\n```\n\nafter code\n````");
+    assert!(styled(&text, "unfinished").iter().all(|(_, style)| *style == comment));
+    let after = styled(&text, "after code");
+    assert!(!after.is_empty() && after.iter().all(|(_, style)| *style == Style::default()));
   }
 
   #[test]

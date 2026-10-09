@@ -1,5 +1,5 @@
 use pulldown_latex::event::{
-  Content, EnvironmentFlow as Flow, Grouping, ScriptType, StateChange, Visual,
+  Content, EnvironmentFlow as Flow, Grouping, ScriptPosition, ScriptType, StateChange, Visual,
 };
 use pulldown_latex::{Event, Parser, Storage};
 use unicode_segmentation::UnicodeSegmentation;
@@ -137,6 +137,25 @@ impl Block {
     lines.extend(center(bottom));
     Self { lines, base }
   }
+
+  fn limits(self, lower: Option<Self>, upper: Option<Self>, centered: bool) -> Self {
+    let text = self.trim();
+    let base_width = text.width();
+    let lower = lower.map(Self::trim);
+    let upper = upper.map(Self::trim);
+    let width = lower.iter().chain(&upper).map(Self::width).max().unwrap_or(0);
+    let width = width.max(base_width);
+    let limit = |block: Self| {
+      let pad = if centered { (width - block.width()) / 2 } else { base_width };
+      block.lines.into_iter().map(move |line| format!("{}{line}", " ".repeat(pad)))
+    };
+    let mut lines: Vec<_> = upper.into_iter().flat_map(limit).collect();
+    let base = lines.len() + text.base;
+    let pad = if centered { (width - base_width) / 2 } else { 0 };
+    lines.extend(text.lines.into_iter().map(|line| format!("{}{line}", " ".repeat(pad))));
+    lines.extend(lower.into_iter().flat_map(limit));
+    Self { lines, base }
+  }
 }
 
 struct Render<'a, 'b> {
@@ -240,21 +259,40 @@ impl Render<'_, '_> {
         text.append(radicand.operand());
         text
       }
-      Event::Script { ty, .. } => {
+      Event::Script { ty, position } => {
+        let stacked = self.block
+          && (*position != ScriptPosition::Right
+            || matches!(self.events.first(), Some(Event::Content(Content::LargeOp { .. }))));
         let base = next(self)?;
         let gap = base.lines[base.base].ends_with(' ');
-        let mut text = base.operand();
-        let mut suffix = String::new();
-        if matches!(ty, ScriptType::Subscript | ScriptType::SubSuperscript) {
-          suffix.push_str(&script(&self.inline(depth + 1)?, false));
+        let mut args = [None, None];
+        for (i, present) in [
+          matches!(ty, ScriptType::Subscript | ScriptType::SubSuperscript),
+          matches!(ty, ScriptType::Superscript | ScriptType::SubSuperscript),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+          if present {
+            args[i] =
+              Some(if stacked { next(self)? } else { Block::text(self.inline(depth + 1)?) });
+          }
         }
-        if matches!(ty, ScriptType::Superscript | ScriptType::SubSuperscript) {
-          suffix.push_str(&script(&self.inline(depth + 1)?, true));
-        }
+        let [lower, upper] = args;
+        let mut text = if stacked {
+          base.limits(lower, upper, *position != ScriptPosition::Right)
+        } else {
+          let mut text = base.operand();
+          for (arg, upper) in [(lower, false), (upper, true)] {
+            if let Some(arg) = arg {
+              text.append(Block::text(script(&arg.lines[0], upper)));
+            }
+          }
+          text
+        };
         if gap {
-          suffix.push(' ');
+          text.append(Block::text(" "));
         }
-        text.append(Block::text(suffix));
         text
       }
       Event::Space { width, .. } => Block::text(if width.is_some() { " " } else { "" }),
@@ -327,6 +365,21 @@ mod tests {
     assert!(!render(source, false).contains('\n'));
     assert_eq!(render(r"x = \frac{\frac{a}{b}}{c}", true), "    a\n    ─\n    b\nx = ─\n    c");
     assert_eq!(render(r"a_i^2 + b_i^2 = c_i^2", false), "aᵢ² + bᵢ² = cᵢ²");
+  }
+
+  #[test]
+  fn block_limits_align_vertically_and_preserve_latex_positions() {
+    assert_eq!(
+      render(r"\int_0^1 x^2\,dx = \frac{1}{3}", true),
+      " 1         1\n∫  x² dx = ─\n 0         3"
+    );
+    assert_eq!(render(r"\int\limits_0^1 x", true), "1\n∫ x\n0");
+    assert_eq!(render(r"\sum_{i=1}^n x_i", true), "  n\n  ∑   xᵢ\ni = 1");
+    assert_eq!(render(r"\sum\nolimits_0^1 x", true), " 1\n∑  x\n 0");
+    assert_eq!(render(r"\int_0 x", true), "∫  x\n 0");
+    assert_eq!(render(r"\int^1 x", true), " 1\n∫  x");
+    assert_eq!(render(r"\int_0^1 x^2", false), "∫₀¹ x²");
+    assert_eq!(render(r"x_i^2", true), "xᵢ²");
   }
 
   #[test]

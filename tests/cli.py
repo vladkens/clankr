@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "pyte==0.8.2",
+# ]
+# ///
 """Exercise the ordinary clankr executable in a PTY with pyte==0.8.2.
 
 Checks key bytes, transcript and cleanup. pyte does not prove native Ghostty
@@ -257,6 +263,21 @@ class Terminal:
         self.until(lambda: title in self.display and "esc close" in self.display
                    and self.screen.display[self.screen.cursor.y + 1].startswith("─"), title)
 
+    def edited(self, expected):
+        """Check the draft in the real PTY, then clear it without a mock round trip."""
+        def draft():
+            rows = self.screen.display
+            cursor = self.screen.cursor.y
+            top = next((i for i in range(cursor - 1, -1, -1) if rows[i].startswith("─")), -1)
+            bottom = next((i for i in range(cursor + 1, len(rows)) if rows[i].startswith("─")), len(rows))
+            return [unicodedata.normalize("NFC", row.rstrip()) for row in rows[top + 1:bottom]]
+
+        lines = [unicodedata.normalize("NFC", line.replace("\t", "    ").rstrip())
+                 for line in expected.split("\n")]
+        self.until(lambda: draft() == lines, f"edited draft {expected!r}")
+        self.send("\x03")
+        self.until(lambda: draft() == [""], "clear edited draft")
+
     def submit(self, expected, model="echo"):
         start = len(self.output)
         self.send("\r")
@@ -344,46 +365,50 @@ def tui(binary):
                 "Submitted text must be bold and wrapped by the terminal")
         require(terminal.screen.buffer[2][0].bold, "Submitted text must be bold")
         require(not terminal.screen.buffer[8][0].bold, "Answer text must remain regular")
+        terminal.resize(119, 12)
         terminal.paste("HISTORY-SEED")
         terminal.submit("HISTORY-SEED")
         terminal.send("first" + ESC + "[13;2u" + "second" + ESC + "\r" + "third")
-        terminal.submit("first\nsecond\nthird")
+        terminal.edited("first\nsecond\nthird")
 
         # Clear a complete logical line from its middle, then remove its empty row.
         for erase in ("\x15", ESC + "[127;9u"):
             terminal.paste("keep\nremove\nlast")
             terminal.send(UP + LEFT * 2 + erase + erase)
-            terminal.submit("keep\nlast")
+            terminal.edited("keep\nlast")
             for value, move, expected in (("\nnext", HOME + UP, "next"),
                                           ("keep\n", "", "keep")):
                 terminal.paste(value)
                 terminal.send(move + erase)
-                terminal.submit(expected)
+                terminal.edited(expected)
 
         for erase in (ESC + "\x7f", "\x17"):
             terminal.paste("keep 界e\u0301 👩‍💻")
             terminal.send(erase)
-            terminal.submit("keep 界e\u0301 ")
+            terminal.edited("keep 界e\u0301 ")
         terminal.paste("a界e\u0301👩‍💻z")
         terminal.send(LEFT + "\x7f" + "\x7f")
         terminal.submit("a界z")
         terminal.paste("abcd")
         terminal.send(HOME + RIGHT + ESC + "[3~" + END + "!")
-        terminal.submit("acd!")
+        terminal.edited("acd!")
         terminal.paste("first\nlast")
         terminal.send("\x01!\x05?")
-        terminal.submit("first\n!last?")
+        terminal.edited("first\n!last?")
         for back, forward in ((ESC + "b", ESC + "f"), (ESC + "[1;3D", ESC + "[1;3C")):
             terminal.paste("one two")
             terminal.send(back + "X" + forward + "!")
-            terminal.submit("one Xtwo!")
+            terminal.edited("one Xtwo!")
         terminal.paste("clean\r\nline\t\x1b[2J\u202e")
-        terminal.submit("clean\nline\t[2J")
-        for index in range(20):
+        terminal.edited("clean\nline\t[2J")
+        # Three turns in a small viewport exercise scrollback without twenty mock delays.
+        # The renderer's Rust test still checks all twenty turns without a real clock.
+        for index in range(3):
             terminal.paste(f"turn-{index:02}")
             terminal.submit(f"turn-{index:02}")
+        require(len(terminal.screen.history.top) > 0, "History never reached scrollback")
         require(terminal.transcript.count("HISTORY-SEED") == 2, "Completed history changed")
-        for index in range(20):
+        for index in range(3):
             require(terminal.transcript.count(f"turn-{index:02}") == 2, "Lost or duplicate turn")
         terminal.paste("resize draft 界\nlast")
         terminal.until(lambda: "resize draft" in terminal.display, "draft before resize")
@@ -808,11 +833,33 @@ def models(binary):
 
 
 def main():
+    cases = {"tui": tui, "menus": menus, "models": models, "markdown": markdown}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
-    parser.add_argument("--case", choices=["tui", "menus", "models", "markdown"], required=True)
+    parser.add_argument("--case", choices=["all", *cases], default="all")
     args = parser.parse_args()
-    {"tui": tui, "menus": menus, "models": models, "markdown": markdown}[args.case](args.bin.resolve(strict=True))
+    binary = args.bin.resolve(strict=True)
+    started = time.monotonic()
+    if args.case != "all":
+        cases[args.case](binary)
+        print(f"TIME {args.case}: {time.monotonic() - started:.2f}s", flush=True)
+        return
+
+    # Separate processes keep PTYs isolated and avoid forking from worker threads.
+    children = []
+    try:
+        for case in cases:
+            children.append(subprocess.Popen(
+                [sys.executable, __file__, "--bin", str(binary), "--case", case]))
+        codes = [child.wait() for child in children]
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.send_signal(signal.SIGINT)
+            child.wait()
+
+    print(f"TIME all: {time.monotonic() - started:.2f}s", flush=True)
+    sys.exit(1 if any(codes) else 0)
 
 
 if __name__ == "__main__":
