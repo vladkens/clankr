@@ -23,7 +23,7 @@ A minimalist terminal harness for AI agents. Follow [docs/roadmap.md](docs/roadm
 
 ## Workflow
 
-- Branch from `main` as `feat/<name>` (features, models, speed, docs) or `fix/<name>` (bugs). Each agent works in its own git worktree, so parallel tasks don't touch each other's files.
+- Branch from `main` as `feat/<name>`, whatever the change. Each agent works in its own git worktree, so parallel tasks don't touch each other's files.
 - Keep `old` as a read-only implementation reference; port needed behavior instead of merging it.
 - Make each authorized commit one coherent, verified change, including its supporting tests and requested documentation. Use a short lowercase English subject without prefixes or a body.
 - Fold corrections into the unfinished commit they repair only when amending or rewriting that commit is authorized. Integrate each task into `main` as one complete commit, then remove its branch; preserve `main` and `old`.
