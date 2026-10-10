@@ -13,10 +13,10 @@ use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchron
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::input::{Input, Layout};
+use super::menu::{Item, Kind, Menu, VISIBLE};
 use crate::Res;
-use crate::input::{self, Input, Layout};
 use crate::markdown::{Markdown, Text};
-use crate::menu::{Item, Kind, Menu, VISIBLE};
 
 pub struct Frame<'a> {
   pub input: &'a Input,
@@ -132,7 +132,7 @@ fn rule(cols: u16) -> Line {
 }
 
 fn clean(text: &str, cursor: usize) -> (String, usize) {
-  input::clean(text, cursor, true)
+  crate::text::clean(text, cursor, true)
 }
 
 fn wrap(text: &str, cols: u16, first: &str, rest: &str, style: Style) -> Vec<Line> {
@@ -479,7 +479,7 @@ impl Live {
     self.patch(&mut bytes, &[], (0, 0))?;
     queue!(bytes, SetAttribute(Attribute::Reset), SetAttribute(Attribute::Bold))?;
     if self.background {
-      queue!(bytes, SetBackgroundColor(Color::AnsiValue(crate::theme::SLOT)))?;
+      queue!(bytes, SetBackgroundColor(Color::AnsiValue(super::theme::SLOT)))?;
       for (i, line) in clean(text, 0).0.split('\n').enumerate() {
         if i > 0 {
           write!(bytes, "\r\n")?;
@@ -1108,7 +1108,7 @@ mod tests {
     });
     let mut input = Input::default();
     input.insert("before $").unwrap();
-    let mut menu = Menu::open(&input, crate::model::Settings::default()).unwrap();
+    let mut menu = Menu::open(&input, crate::agent::model::Settings::default()).unwrap();
     for _ in 0..7 {
       menu.step(true);
     }
@@ -1245,7 +1245,7 @@ mod tests {
 
     input = Input::default();
     input.insert("$").unwrap();
-    let menu = Menu::open(&input, crate::model::Settings::default()).unwrap();
+    let menu = Menu::open(&input, crate::agent::model::Settings::default()).unwrap();
     let lines = texts(footer(&Frame { menu: Some(&menu), ..frame(&input) }, 40, 12).0);
     assert_eq!(lines[..3], [&rule, "$", &rule]);
     assert!(lines[3].starts_with("Skills 8") && lines[3].ends_with("1–5"));

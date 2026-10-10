@@ -1,203 +1,18 @@
-use std::io::Write;
+mod math;
+mod syntax;
+mod text;
+
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use crossterm::queue;
-use crossterm::style::{Attribute, SetAttribute};
 use mdtext::{Alignment, Event, ListKind, Options, Parser, Tag};
-use osc8::Hyperlink;
+use syntax::Code;
+pub(super) use text::Text;
+use text::{BLUE, CYAN, Link, Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use url::Url;
 
-use crate::syntax::Code;
-use crate::{Res, input};
-
-// Classic SGR foregrounds use the terminal's own palette, so printed history follows theme changes.
-// Black, white and bright colours are avoided: some themes render them like the background.
-const RED: u8 = 31;
-const GREEN: u8 = 32;
-const YELLOW: u8 = 33;
-const BLUE: u8 = 34;
-const MAGENTA: u8 = 35;
-const CYAN: u8 = 36;
-
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct Style {
-  flags: u8,
-  colour: Option<u8>,
-}
-
-impl Style {
-  const BOLD: u8 = 1;
-  const ITALIC: u8 = 2;
-  const STRIKE: u8 = 4;
-  const FAINT: u8 = 8;
-
-  fn with(self, flag: u8) -> Self {
-    Self { flags: self.flags | flag, ..self }
-  }
-
-  fn colour(self, colour: u8) -> Self {
-    Self { colour: Some(colour), ..self }
-  }
-
-  fn syntax(self, scope: &str) -> Self {
-    match scope {
-      "comment" => self.with(Self::FAINT | Self::ITALIC),
-      "keyword" => self.colour(MAGENTA),
-      "string" | "character" | "diff.plus" => self.colour(GREEN),
-      "diff.minus" => self.colour(RED),
-      "number" | "float" | "boolean" | "constant" => self.colour(YELLOW),
-      "function" => self.colour(BLUE),
-      "type" | "constructor" | "namespace" => self.colour(CYAN),
-      _ => self,
-    }
-  }
-
-  pub fn write(self, out: &mut impl Write) -> Res<()> {
-    queue!(out, SetAttribute(Attribute::Reset))?;
-    for (flag, attr) in [
-      (Self::BOLD, Attribute::Bold),
-      (Self::FAINT, Attribute::Dim),
-      (Self::ITALIC, Attribute::Italic),
-      (Self::STRIKE, Attribute::CrossedOut),
-    ] {
-      if self.flags & flag != 0 {
-        queue!(out, SetAttribute(attr))?;
-      }
-    }
-    // crossterm would encode named colours as 38;5;n.
-    if let Some(colour) = self.colour {
-      write!(out, "\x1b[{colour}m")?;
-    }
-    Ok(())
-  }
-}
-
-#[derive(Default, Debug, PartialEq, Eq)]
-pub struct Text {
-  pub text: String,
-  spans: Vec<Span>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Link {
-  uri: String,
-  id: u64,
-}
-
-impl Link {
-  fn new(target: &str) -> Option<Rc<Self>> {
-    if target.is_empty() || target.chars().any(input::is_control) {
-      return None;
-    }
-    let uri = Url::parse(target).ok().or_else(|| {
-      let dir = std::env::current_dir().ok()?;
-      Url::from_directory_path(dir).ok()?.join(target).ok()
-    })?;
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    Some(Rc::new(Self { uri: uri.into(), id: NEXT.fetch_add(1, Ordering::Relaxed) }))
-  }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Span {
-  start: usize,
-  style: Style,
-  link: Option<Rc<Link>>,
-}
-
-impl Text {
-  fn wrap(&self, width: usize) -> Vec<Self> {
-    let mut lines = Vec::new();
-    let (mut start, mut used, mut space) = (0, 0, 0);
-    for (pos, g) in self.text.grapheme_indices(true) {
-      if used + g.width() > width && pos > start {
-        let end = if space > start { space } else { pos };
-        lines.push(self.slice(start..end));
-        start = end;
-        used = self.text[start..pos].width();
-      }
-      used += g.width();
-      if g.chars().all(char::is_whitespace) {
-        space = pos + g.len();
-      }
-    }
-    lines.push(self.slice(start..self.text.len()));
-    lines
-  }
-
-  fn slice(&self, range: Range<usize>) -> Self {
-    let mut out = Self::default();
-    let mut pos = 0;
-    for (text, style, link) in self.parts() {
-      let start = range.start.saturating_sub(pos).min(text.len());
-      let end = range.end.saturating_sub(pos).min(text.len());
-      if start < end {
-        out.push(&text[start..end], style, link);
-      }
-      pos += text.len();
-    }
-    out
-  }
-
-  fn parts(&self) -> impl Iterator<Item = (&str, Style, Option<&Rc<Link>>)> {
-    self.spans.iter().enumerate().map(|(i, span)| {
-      let end = self.spans.get(i + 1).map_or(self.text.len(), |span| span.start);
-      (&self.text[span.start..end], span.style, span.link.as_ref())
-    })
-  }
-
-  fn push(&mut self, text: &str, style: Style, link: Option<&Rc<Link>>) {
-    if text.is_empty() {
-      return;
-    }
-    if self.spans.last().is_none_or(|last| last.style != style || last.link.as_ref() != link) {
-      self.spans.push(Span { start: self.text.len(), style, link: link.cloned() });
-    }
-    self.text.push_str(text);
-  }
-
-  pub fn write(&self, out: &mut impl Write, range: Range<usize>) -> Res<()> {
-    let mut pos = range.start;
-    let mut index = self.spans.partition_point(|span| span.start <= pos).saturating_sub(1);
-    let mut link = None;
-    while pos < range.end {
-      let span = &self.spans[index];
-      let end = self.spans.get(index + 1).map_or(range.end, |span| span.start.min(range.end));
-      if link != span.link.as_deref() {
-        link = span.link.as_deref();
-        // OSC 8 is independent of SGR; close it before writing the footer or moving the cursor.
-        match link {
-          Some(link) => {
-            let id = format!("clankr-{}-{}", std::process::id(), link.id);
-            write!(out, "{}", Hyperlink::new(&link.uri).with_id(&id))?;
-          }
-          None => write!(out, "{}", Hyperlink::END)?,
-        }
-      }
-      span.style.write(out)?;
-      if link.is_some() {
-        queue!(out, SetAttribute(Attribute::Underlined))?;
-      }
-      for part in self.text[pos..end].split_inclusive('\n') {
-        out.write_all(part.trim_end_matches('\n').as_bytes())?;
-        if part.ends_with('\n') {
-          out.write_all(b"\r\n")?;
-        }
-      }
-      pos = end;
-      index += 1;
-    }
-    if link.is_some() {
-      write!(out, "{}", Hyperlink::END)?;
-    }
-    queue!(out, SetAttribute(Attribute::Reset))?;
-    Ok(())
-  }
-}
+use crate::text::clean;
 
 enum Kind {
   Block,
@@ -260,7 +75,7 @@ impl Render {
 
   // mdtext emits fenced code one complete line at a time; only the final line may lack '\n'.
   fn code(&mut self, text: &str) {
-    let mut text = input::clean(text, 0, true).0;
+    let mut text = clean(text, 0, true).0;
     if text.is_empty() {
       return;
     }
@@ -337,7 +152,7 @@ impl Render {
   }
 
   fn push(&mut self, text: &str) {
-    let text = input::clean(text, 0, true).0;
+    let text = clean(text, 0, true).0;
     if text.is_empty() {
       return;
     }
@@ -382,7 +197,7 @@ impl Render {
       Event::Text(text) | Event::Html(text) => {
         self.push(&text);
       }
-      Event::InlineMath(text) => self.push(&crate::math::render(&text, false)),
+      Event::InlineMath(text) => self.push(&math::render(&text, false)),
       Event::DisplayMath(text) => {
         if let Some(Open { kind: Kind::Math(source), .. }) = self.stack.last_mut() {
           source.push_str(&text);
@@ -667,7 +482,7 @@ impl Render {
     match open.kind {
       Kind::Block | Kind::Quote | Kind::List(_) => self.space(2),
       Kind::Math(source) => {
-        self.push(&crate::math::render(&source, true));
+        self.push(&math::render(&source, true));
         self.space(2);
       }
       // Tight items are adjacent even though the parser emits paragraph boundaries inside them.
@@ -778,7 +593,7 @@ impl Markdown {
       };
       let start = pending.char_indices().rev().nth(4095).map_or(0, |(i, _)| i);
       let mut text = Text::default();
-      text.push(&input::clean(&pending[start..], 0, true).0, Style::default(), None);
+      text.push(&clean(&pending[start..], 0, true).0, Style::default(), None);
       return text;
     }
     let shown =
@@ -803,6 +618,9 @@ impl Markdown {
 
 #[cfg(test)]
 mod tests {
+  use text::{GREEN, MAGENTA, RED, YELLOW};
+  use url::Url;
+
   use super::*;
 
   fn render(source: &str) -> Text {

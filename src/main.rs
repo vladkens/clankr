@@ -1,13 +1,7 @@
 mod agent;
-mod chat;
-mod input;
 mod markdown;
-mod math;
-mod menu;
-mod model;
-mod syntax;
-mod theme;
-mod view;
+mod text;
+mod ui;
 
 type Res<T> = Result<T, Error>;
 
@@ -30,8 +24,8 @@ enum Error {
 }
 
 fn main() {
-  if let Err(error) = chat::run() {
-    eprintln!("Error: {}", input::clean(&error.to_string(), 0, true).0);
+  if let Err(error) = ui::run(Box::new(agent::Echo::default())) {
+    ui::report(&error);
     std::process::exit(1);
   }
 }

@@ -4,7 +4,7 @@ Local paths in this example assume clankr is running from the project root.
 
 ## Long paragraph and formatting boundaries
 
-This paragraph deliberately spans several screen rows: it starts with plain text, followed by **a bold fragment with *italics inside***, then more plain text, and near the end comes [**a long link label pointing to the Markdown renderer's source code, which may also cross the terminal's right edge**](src/markdown.rs). Underlining should stop immediately after the link. There is also ~~an outdated version~~, `inline_code`, Cyrillic, 界, a combining character é, and an emoji 👩‍💻. When narrowing and widening the window, words should keep their order, and copying the paragraph should not introduce extra newlines from screen wrapping.
+This paragraph deliberately spans several screen rows: it starts with plain text, followed by **a bold fragment with *italics inside***, then more plain text, and near the end comes [**a long link label pointing to the Markdown renderer's source code, which may also cross the terminal's right edge**](src/markdown/mod.rs). Underlining should stop immediately after the link. There is also ~~an outdated version~~, `inline_code`, Cyrillic, 界, a combining character é, and an emoji 👩‍💻. When narrowing and widening the window, words should keep their order, and copying the paragraph should not introduce extra newlines from screen wrapping.
 
 Plain text. **Bold.** Plain. *Italic.* Plain. ~~Strikethrough.~~ Plain. [Link](src/main.rs). Plain. [`Code inside a link`](Cargo.toml). Plain.
 

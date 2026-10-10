@@ -1,84 +1,18 @@
 use std::collections::VecDeque;
-use std::io::{self, IsTerminal, Write};
-use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-  self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-  KeyModifiers as Mods, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-  PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::style::{Attribute, SetAttribute};
-use crossterm::terminal::{self, EndSynchronizedUpdate, disable_raw_mode, enable_raw_mode};
-use osc8::Hyperlink;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers as Mods};
+use crossterm::terminal;
 
-use crate::agent::{self, Backend, Echo, Phase, Prompt, Usage};
-use crate::input::{History, Input};
-use crate::menu::{Command, Kind, Menu};
-use crate::model::Settings;
-use crate::theme::{self, Theme};
-use crate::view::{self, Frame, Live};
+use super::input::{History, Input};
+use super::menu::{Command, Kind, Menu};
+use super::terminal::Terminal;
+use super::theme::Theme;
+use super::view::{self, Frame, Live};
+use crate::agent::model::Settings;
+use crate::agent::{self, Backend, Phase, Prompt, Usage};
 use crate::{Error, Res};
-
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static ENHANCED: AtomicBool = AtomicBool::new(false);
-static HOOK: Once = Once::new();
-
-fn restore() {
-  if ACTIVE.swap(false, Ordering::SeqCst) {
-    let mut out = io::stdout();
-    theme::restore(&mut out);
-    restore_modes(&mut out, ENHANCED.swap(false, Ordering::SeqCst), disable_raw_mode);
-  }
-}
-
-fn restore_modes(out: &mut impl Write, enhanced: bool, disable: impl FnOnce() -> io::Result<()>) {
-  if enhanced {
-    let _ = execute!(out, PopKeyboardEnhancementFlags);
-  }
-  let _ = execute!(out, EndSynchronizedUpdate, DisableBracketedPaste);
-  let _ = write!(out, "{}{}\r\n", Hyperlink::END, SetAttribute(Attribute::Reset));
-  let _ = out.flush();
-  let _ = disable();
-}
-
-struct Keyboard;
-
-impl Keyboard {
-  fn enter() -> Res<Self> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-      return Err(Error::NotTerminal);
-    }
-    HOOK.call_once(|| {
-      let old = std::panic::take_hook();
-      std::panic::set_hook(Box::new(move |info| {
-        restore();
-        old(info);
-      }));
-    });
-    if ACTIVE.swap(true, Ordering::SeqCst) {
-      return Err(Error::KeyboardActive);
-    }
-    let guard = Self;
-    enable_raw_mode()?;
-    // Unsupported terminals ignore the push; no query competes with the event reader.
-    ENHANCED.store(true, Ordering::SeqCst);
-    execute!(
-      io::stdout(),
-      PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-      EnableBracketedPaste
-    )?;
-    Ok(guard)
-  }
-}
-
-impl Drop for Keyboard {
-  fn drop(&mut self) {
-    restore();
-  }
-}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
@@ -171,12 +105,6 @@ struct App {
   settings: Settings,
   last_response: Option<String>,
   messages: Vec<String>,
-}
-
-impl Default for App {
-  fn default() -> Self {
-    Self::new(Box::new(Echo::default()))
-  }
 }
 
 impl App {
@@ -534,10 +462,10 @@ impl App {
   }
 }
 
-pub fn run() -> Res<()> {
-  let _keyboard = Keyboard::enter()?;
+pub fn run(backend: Box<dyn Backend>) -> Res<()> {
+  let _terminal = Terminal::enter()?;
   let mut out = io::stdout();
-  let mut app = App::default();
+  let mut app = App::new(backend);
   let mut clipboard = None;
   let mut live = Live::terminal();
   let mut theme = Theme::default();
@@ -623,6 +551,13 @@ mod tests {
   use crossterm::event::KeyEvent;
 
   use super::*;
+  use crate::agent::Echo;
+
+  impl Default for App {
+    fn default() -> Self {
+      Self::new(Box::new(Echo::default()))
+    }
+  }
 
   fn key(code: KeyCode, modifiers: Mods) -> Event {
     Event::Key(KeyEvent::new(code, modifiers))
@@ -651,7 +586,7 @@ mod tests {
     submit(&mut app, &mut live, &mut out);
     type_text(&mut app, "second");
     submit(&mut app, &mut live, &mut out);
-    app.settings.select(crate::model::Model::find("sonnet").unwrap());
+    app.settings.select(crate::agent::model::Model::find("sonnet").unwrap());
     let settings = app.settings;
     app.input.insert("third ").unwrap();
     app.input.mention(app.input.pos..app.input.pos, "agent-rules").unwrap();
@@ -851,7 +786,7 @@ mod tests {
 
   #[test]
   fn model_and_effort_pickers_apply_independently_and_never_send_commands_as_prompts() {
-    use crate::model::Effort;
+    use crate::agent::model::Effort;
 
     let mut app = App::default();
     app.event(key(KeyCode::Char('.'), Mods::CONTROL), 80).unwrap();
@@ -934,7 +869,7 @@ mod tests {
 
   #[test]
   fn hotkeys_preserve_the_editor_and_new_settings_do_not_change_an_active_request() {
-    use crate::model::Effort;
+    use crate::agent::model::Effort;
 
     let peer = Rc::new(RefCell::new(Peer::default()));
     let mut app = App::new(Box::new(Script(peer.clone())));
@@ -1310,24 +1245,5 @@ mod tests {
     assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::Exit);
     app.input = Input::default();
     assert_eq!(app.event(key(KeyCode::Char('d'), Mods::CONTROL), 80).unwrap(), Action::Exit);
-  }
-
-  #[test]
-  fn cleanup_attempts_raw_mode_restoration_even_if_output_is_broken() {
-    struct Broken;
-    impl Write for Broken {
-      fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-        Err(io::ErrorKind::BrokenPipe.into())
-      }
-      fn flush(&mut self) -> io::Result<()> {
-        Err(io::ErrorKind::BrokenPipe.into())
-      }
-    }
-    let mut restored = false;
-    restore_modes(&mut Broken, true, || {
-      restored = true;
-      Ok(())
-    });
-    assert!(restored);
   }
 }

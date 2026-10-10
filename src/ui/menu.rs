@@ -1,8 +1,8 @@
 use std::ops::Range;
 
+use super::input::Input;
 use crate::Res;
-use crate::input::Input;
-use crate::model::{Effort, MODELS, Model, Settings};
+use crate::agent::model::{Effort, MODELS, Model, Settings};
 
 pub const VISIBLE: usize = 6;
 
