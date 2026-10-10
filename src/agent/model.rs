@@ -49,7 +49,7 @@ pub struct Model {
   pub fast: bool,
 }
 
-// UI fixtures, including capabilities and defaults; not a live provider catalog.
+// Codex capabilities match its current model catalog. Echo and Claude remain UI fixtures.
 pub const MODELS: &[Model] = &[
   Model {
     name: "echo",
@@ -72,16 +72,16 @@ pub const MODELS: &[Model] = &[
     description: "Complex tasks",
     provider: "OpenAI",
     efforts: Effort::ALL,
-    default_effort: Some(Effort::High),
+    default_effort: Some(Effort::Low),
     fast: true,
   },
   Model {
     name: "gpt-6-luna",
     description: "Quick everyday tasks",
     provider: "OpenAI",
-    efforts: &[Effort::Low, Effort::Medium, Effort::High],
+    efforts: &[Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max],
     default_effort: Some(Effort::Medium),
-    fast: false,
+    fast: true,
   },
   Model {
     name: "opus",
