@@ -84,7 +84,7 @@ impl Backend for Echo {
     true
   }
 
-  fn status(&self) -> Status<'_> {
+  fn status(&self, _model: &super::model::Model) -> Status<'_> {
     Status { mode: "auto", context: (self.context > 0).then_some((self.context, 272_000)) }
   }
 
@@ -137,6 +137,7 @@ mod tests {
               response.push_str(&text);
             }
             Event::Usage(counts) => usage = Some(counts),
+            Event::Notice(_) => panic!("echo does not emit notices"),
             Event::Finished(result) => {
               result.unwrap();
               assert!(ms >= 2000);
@@ -154,7 +155,10 @@ mod tests {
       }
       let count = prompt.chars().count().div_ceil(4) as u64;
       assert_eq!(usage, Some(Usage { input: count, output: count }));
-      assert_eq!(echo.status().context, Some((count * 2, 272_000)));
+      assert_eq!(
+        echo.status(super::super::model::Settings::default().model).context,
+        Some((count * 2, 272_000))
+      );
     }
   }
 
@@ -174,7 +178,7 @@ mod tests {
       assert!(matches!(echo.poll_at(now), Some(Event::Usage(_))));
       echo.reset();
       assert!(echo.poll_at(now + Duration::from_secs(5)).is_none());
-      assert!(echo.status().context.is_none());
+      assert!(echo.status(super::super::model::Settings::default().model).context.is_none());
     }
   }
 }

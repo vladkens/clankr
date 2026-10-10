@@ -39,7 +39,7 @@ impl Effort {
   }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Model {
   pub name: &'static str,
   pub description: &'static str,
@@ -109,6 +109,38 @@ pub const MODELS: &[Model] = &[
   },
 ];
 
+// https://platform.claude.com/docs/en/models/overview
+pub const LIVE_MODELS: &[Model] = &[
+  MODELS[1],
+  MODELS[2],
+  MODELS[3],
+  Model {
+    name: "claude-opus-5-5",
+    description: "Long-running coding and complex tasks",
+    provider: "Anthropic",
+    efforts: &[Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max],
+    default_effort: Some(Effort::Medium),
+    fast: true,
+  },
+  Model {
+    name: "claude-sonnet-5-5",
+    description: "Everyday coding tasks",
+    provider: "Anthropic",
+    efforts: &[Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max],
+    default_effort: Some(Effort::High),
+    fast: false,
+  },
+  Model {
+    name: "claude-haiku-5-5",
+    description: "Quick answers",
+    provider: "Anthropic",
+    efforts: &[Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max],
+    default_effort: Some(Effort::Medium),
+    fast: false,
+  },
+];
+
+#[cfg(test)]
 impl Model {
   pub fn find(name: &str) -> Option<&'static Self> {
     MODELS.iter().find(|model| model.name == name)

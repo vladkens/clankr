@@ -17,7 +17,7 @@ pub enum Command {
 }
 
 impl Command {
-  pub fn parse(text: &str) -> Option<Self> {
+  pub fn parse(text: &str, models: &'static [Model]) -> Option<Self> {
     if text.contains('\n') {
       return None;
     }
@@ -29,7 +29,7 @@ impl Command {
       "/quit" if value.is_empty() => Some(Self::Quit),
       "/fast" if value.is_empty() => Some(Self::Fast),
       "/copy" if value.is_empty() => Some(Self::Copy),
-      "/model" => Some(Self::Model(Model::find(value))),
+      "/model" => Some(Self::Model(models.iter().find(|model| model.name == value))),
       "/effort" => Some(Self::Effort(Effort::parse(value))),
       _ => None,
     }
@@ -198,8 +198,10 @@ impl Menu {
   pub fn choose(&self, input: &mut Input, complete: bool) -> Res<Option<Command>> {
     let Some(item) = self.items.get(self.selected) else { return Ok(None) };
     match self.kind {
-      Kind::Commands if !complete => Ok(Command::parse(item.name)),
-      Kind::Models if !complete => Ok(Some(Command::Model(Model::find(item.name)))),
+      Kind::Commands if !complete => Ok(Command::parse(item.name, self.models)),
+      Kind::Models if !complete => {
+        Ok(Some(Command::Model(self.models.iter().find(|model| model.name == item.name))))
+      }
       Kind::Effort if !complete => Ok(Some(Command::Effort(Effort::parse(item.name)))),
       Kind::Commands | Kind::Models | Kind::Effort => {
         input.replace(self.range.clone(), &format!("{} ", item.name))?;
@@ -344,8 +346,8 @@ mod tests {
       assert!(Menu::open(&input(text), Settings::default(), MODELS).is_none(), "{text}");
     }
     assert!(Menu::open(&input("`code` then $age"), Settings::default(), MODELS).is_some());
-    assert_eq!(Command::parse("/clear "), Some(Command::Clear));
-    assert_eq!(Command::parse("/clear\n"), None);
+    assert_eq!(Command::parse("/clear ", MODELS), Some(Command::Clear));
+    assert_eq!(Command::parse("/clear\n", MODELS), None);
   }
 
   #[test]

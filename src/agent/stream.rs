@@ -40,7 +40,8 @@ impl Sse {
         continue;
       }
       // Decode frames, not network chunks: any UTF-8 character can span reads.
-      let frame = std::str::from_utf8(&self.buf).map_err(|_| INVALID)?;
+      let frame = std::str::from_utf8(&self.buf)
+        .map_err(|_| Error::Provider("Invalid UTF-8 in SSE stream"))?;
       let frame = if self.started { frame } else { frame.trim_start_matches('\u{feff}') };
       self.started = true;
       let (mut name, mut data) = ("", String::new());

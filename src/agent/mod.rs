@@ -1,9 +1,11 @@
+mod chat;
+mod claude;
 mod codex;
 mod echo;
 pub mod model;
 mod stream;
 
-pub use codex::Codex;
+pub use chat::Chat;
 pub use echo::Echo;
 use model::{MODELS, Model, Settings};
 
@@ -53,6 +55,7 @@ pub enum Event {
   Text(String),
   // Cumulative counts for this request, not deltas. Exact counts come from the provider.
   Usage(Usage),
+  Notice(&'static str),
   Finished(Res<()>),
 }
 
@@ -69,7 +72,7 @@ pub trait Backend {
   fn settings(&self) -> Settings {
     Settings::default()
   }
-  fn status(&self) -> Status<'_>;
+  fn status(&self, model: &Model) -> Status<'_>;
   fn start(&mut self, prompt: Prompt);
   fn poll(&mut self) -> Option<Event>;
   fn cancel(&mut self);

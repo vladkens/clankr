@@ -27,6 +27,7 @@ enum Action {
 struct Request {
   response: String,
   failure: Option<Error>,
+  notice: Option<&'static str>,
   phase: Phase,
   usage: Option<Usage>,
   started: Instant,
@@ -37,6 +38,7 @@ impl Default for Request {
     Self {
       response: String::new(),
       failure: None,
+      notice: None,
       phase: Phase::Thinking,
       usage: None,
       started: Instant::now(),
@@ -131,7 +133,7 @@ impl App {
   fn frame(&self) -> Frame<'_> {
     let response = self.request.as_ref().map_or("", |request| request.response.as_str());
     let activity = self.request.as_ref().map(Request::activity);
-    let status = self.backend.status();
+    let status = self.backend.status(self.settings.model);
     let mut label = format!("{} · {}", status.mode, self.settings.model.name);
     if let Some(effort) = self.settings.effort {
       label.push_str(&format!(" · {}", effort.name()));
@@ -279,6 +281,7 @@ impl App {
       match event {
         agent::Event::Phase(phase) => request.phase = phase,
         agent::Event::Usage(usage) => request.usage = Some(usage),
+        agent::Event::Notice(notice) => request.notice = Some(notice),
         agent::Event::Text(text) if request.failure.is_none() => {
           if text.len() > agent::LIMIT.saturating_sub(request.response.len()) {
             request.failure = Some(Error::ResponseTooLarge);
@@ -298,6 +301,8 @@ impl App {
           }
           if error.is_some() {
             self.paused = true;
+          } else if let Some(notice) = request.notice {
+            self.messages.push(notice.into());
           }
           break;
         }
@@ -412,7 +417,7 @@ impl App {
           }
         }
         if key.code == KeyCode::Enter && !key.modifiers.intersects(Mods::SHIFT | Mods::ALT) {
-          if let Some(command) = Command::parse(&self.input.text) {
+          if let Some(command) = Command::parse(&self.input.text, self.backend.models()) {
             return self.command(command);
           }
           if self.request.is_none() {
@@ -967,7 +972,7 @@ mod tests {
   #[test]
   fn fixture_skills_are_mock_only_and_real_mentions_stay_plain_text() {
     let backends: [(Box<dyn Backend>, bool); 2] =
-      [(Box::new(agent::Codex::default()), false), (Box::new(Echo::default()), true)];
+      [(Box::new(agent::Chat::default()), false), (Box::new(Echo::default()), true)];
     for (backend, skills) in backends {
       let mut app = App::new(backend);
       type_text(&mut app, "$agent-rules");
@@ -1121,28 +1126,50 @@ mod tests {
   struct Script(Rc<RefCell<Peer>>);
 
   #[test]
-  fn codex_starts_with_real_models_and_rejects_mock_provider_selections() {
-    let mut app = App::new(Box::new(agent::Codex::default()));
+  fn chat_starts_with_real_models_and_rejects_mock_selections() {
+    use crate::agent::model::Effort;
+    let mut app = App::new(Box::new(agent::Chat::default()));
     assert_eq!(app.settings.model.name, "gpt-6.1-sol");
     assert!(!app.settings.fast);
     app.command(Command::Model(None)).unwrap();
     let menu = app.menu.as_ref().unwrap();
     assert_eq!(
       menu.items.iter().map(|item| item.name).collect::<Vec<_>>(),
-      ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"]
+      [
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-luna",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5"
+      ]
     );
     app.command(Command::Model(agent::model::Model::find("opus"))).unwrap();
     assert_eq!(app.settings.model.name, "gpt-6.1-sol");
     assert!(app.notice.as_deref().unwrap().contains("not connected"));
     app.command(Command::Model(agent::model::Model::find("gpt-6-astra"))).unwrap();
     assert_eq!(app.settings.model.name, "gpt-6-astra");
+    type_text(&mut app, "/model claude-sonnet-5-5");
+    app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap();
+    assert_eq!(app.settings.model.name, "claude-sonnet-5-5");
+    assert!(app.frame().status.starts_with("claude · claude-sonnet-5-5"));
+    assert_eq!(app.settings.effort, Some(Effort::Low));
+    assert!(!app.settings.fast);
+    type_text(&mut app, "/model claude-opus");
+    app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap();
+    assert_eq!(app.settings.model.name, "claude-opus-5-5");
+    app.settings.effort = Some(Effort::Ultra);
+    type_text(&mut app, "/model claude-haiku-5-5");
+    app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap();
+    assert_eq!(app.settings.model.name, "claude-haiku-5-5");
+    assert_eq!(app.settings.effort, Some(Effort::Medium));
   }
 
   impl Backend for Script {
     fn supports_skills(&self) -> bool {
       true
     }
-    fn status(&self) -> agent::Status<'_> {
+    fn status(&self, _model: &agent::model::Model) -> agent::Status<'_> {
       agent::Status { mode: "auto", context: None }
     }
     fn start(&mut self, prompt: Prompt) {
@@ -1207,6 +1234,37 @@ mod tests {
     assert!(
       matches!(app.event(key(KeyCode::Enter, Mods::NONE), 80).unwrap(), Action::Send(prompt) if prompt.text == draft.text)
     );
+  }
+
+  #[test]
+  fn completion_notices_follow_the_saved_response_and_are_discarded_on_failure() {
+    for failed in [false, true] {
+      let peer = Rc::new(RefCell::new(Peer::default()));
+      let mut app = App::new(Box::new(Script(peer.clone())));
+      let mut live = Live::default();
+      let mut out = Vec::new();
+      app.start("question".into(), &mut live, &mut out).unwrap();
+      app.input.insert("next draft").unwrap();
+      peer.borrow_mut().events.extend([
+        agent::Event::Text("partial answer".into()),
+        agent::Event::Notice("The partial response was saved."),
+      ]);
+      app.poll(&mut live, &mut out, 80).unwrap();
+      assert!(!String::from_utf8_lossy(&out).contains("was saved"));
+      peer.borrow_mut().events.push_back(agent::Event::Finished(if failed {
+        Err(Error::Cancelled)
+      } else {
+        Ok(())
+      }));
+      app.poll(&mut live, &mut out, 80).unwrap();
+      let output = String::from_utf8(out).unwrap();
+      assert_eq!(output.contains("was saved"), !failed);
+      assert_eq!(app.input.text, "next draft");
+      assert_eq!(app.last_response.as_deref(), Some("partial answer"));
+      if !failed {
+        assert!(output.find("partial answer").unwrap() < output.find("was saved").unwrap());
+      }
+    }
   }
 
   #[test]
