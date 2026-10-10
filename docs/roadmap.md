@@ -9,7 +9,7 @@ Build the terminal interface first, then bring the existing agent capabilities f
 | [Skills and tools](plans/20261010-agent-tools.md) | An agent that uses explicit skills, works with files, and runs commands with visible results and approvals. | Future |
 | [Image attachments](plans/20261010-images.md) | Images from files or the clipboard reach the model and remain part of the saved conversation. | Future |
 
-The interface is prepared, including prompt history, request queuing, and submitted-message backgrounds. Codex now streams into the normal TUI with in-memory conversation context; `clankr --mock` retains the offline interface fixture. Next, connect Claude and shared conversation history, then add session persistence. Tools and image attachments build on conversations.
+The interface is prepared, including prompt history, request queuing, and submitted-message backgrounds. Codex and Claude stream into the normal TUI and share conversation history in memory; `clankr --mock` retains the offline interface fixture. Next, add session persistence and restore conversation and model settings on startup. Tools and image attachments build on conversations.
 
 ## Reference implementation
 

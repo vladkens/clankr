@@ -23,16 +23,17 @@ Current integration points: `Backend` and captured `Prompt` in `src/agent/mod.rs
 - [x] Replay completed Codex turns, including final encrypted reasoning and message phase. Reconcile indexed SSE snapshots and deltas, decode UTF-8 strictly, handle EOF and provider errors, bound buffers, and redact credentials. Drain received text before reporting an error; failed or cancelled turns do not enter conversation history.
 - [x] Keep the next draft and queued request settings independent of the running request. Esc cancels network work, exit stops the owned worker, and usage comes from the provider. Counts remain absent until reported.
 - [x] Preserve completed terminal history without reprinting it while events arrive. Provider events use the existing renderer and editor lifecycle.
-- [ ] Connect Claude through the same backend boundary and introduce shared conversation history for provider switching. Reuse read-only credentials and the same cancellation/error guarantees; do not add login or token refresh.
+- [x] Connect Claude through the same backend boundary and share conversation history across providers. Read `CLAUDE_ACCESS_TOKEN` or `$PI_CODING_AGENT_DIR/auth.json` (default `~/.pi/agent/auth.json`) without login, token refresh, or credential writes. Replay native reasoning only to its provider; retain completed text when switching providers.
 
 ### Persistence and model settings
 
 - [ ] Save successful text conversations atomically and restore them on startup. Preserve private permissions, an exclusive lock, and the 16 MiB session limit. Retain the agreed `--session` and `CLANKR_HOME` selection behavior.
 - [ ] Read supported text history from `old`; reject corrupt files, unsupported formats, and unsupported tool/image blocks without overwriting them. Do not silently migrate old data. Checkpoint and attachment support arrive with their respective tasks.
-- [ ] Connect the existing model and effort menus to real provider capabilities. Preserve compatible effort, keep selections independent, save the next-turn choice after success/error/cancel, and define manual model IDs without pretending a local catalog proves API availability.
-- [ ] Extend verified model IDs, effort fields, and fast-mode capabilities to Claude and custom models. Codex effort and fast-mode mapping are connected; custom models must not inherit another model's capabilities.
+- [x] Connect the existing model and effort menus to verified Codex and Claude capabilities. Preserve compatible effort and keep model, effort, and fast-mode selections independent.
+- [ ] Persist the next-turn model settings after success, error, and cancellation.
+- [ ] Add catalog discovery and manual model IDs without pretending a local catalog proves API availability. Custom models must not inherit another model's effort or fast-mode capabilities.
 
-The Codex menu currently includes `gpt-6.1-sol`, `gpt-6-astra`, and `gpt-6-luna`, with effort levels and context limits checked against the installed Codex model catalog. Fast mode sends `service_tier: "priority"` and starts disabled. Full catalog discovery, custom IDs, Claude capabilities, and saved settings remain in this section. Authentication, HTTP, and stream parsing live in `src/agent/codex.rs` and `src/agent/stream.rs`; no session files are written yet.
+Model capabilities live in `src/agent/model.rs`: Codex uses `service_tier: "priority"` for fast mode; Claude Opus 5.5 uses `speed: "fast"` with its beta header. Fast mode starts disabled. Claude Sonnet 5.5 and Haiku 5.5 expose effort controls without fast mode. The shared worker and in-memory history live in `src/agent/chat.rs`; provider authentication, request encoding, and stream parsing live in `src/agent/codex.rs`, `src/agent/claude.rs`, and `src/agent/stream.rs`. Session persistence is the next step.
 
 ### One-shot requests and unavailable models
 

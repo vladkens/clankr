@@ -23,14 +23,14 @@ enum Error {
   Cancelled,
   #[error("{0}")]
   Provider(&'static str),
-  #[error("Codex HTTP {0}")]
+  #[error("Provider HTTP {0}")]
   Http(u16),
 }
 
 fn main() {
   let args: Vec<_> = std::env::args_os().skip(1).collect();
   let backend: Box<dyn agent::Backend> = if args.is_empty() {
-    Box::new(agent::Codex::default())
+    Box::new(agent::Chat::default())
   } else if args.len() == 1 && args[0] == "--mock" {
     Box::new(agent::Echo::default())
   } else {
