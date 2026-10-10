@@ -288,11 +288,18 @@ impl Stream {
           return Err(Error::Provider("Codex response did not complete"));
         }
         let items = rep["output"].as_array().ok_or(INVALID)?;
-        if items.len() > PART_LIMIT || self.items.keys().any(|&i| i >= items.len()) {
-          return Err(CONFLICT);
-        }
-        for (i, item) in items.iter().enumerate() {
-          self.snapshot(i, item, true)?;
+        if items.is_empty() {
+          // Codex can finish with usage only after sending complete output_item.done snapshots.
+          if self.items.iter().enumerate().any(|(next, (&i, item))| i != next || !item.done) {
+            return Err(CONFLICT);
+          }
+        } else {
+          if items.len() > PART_LIMIT || self.items.keys().any(|&i| i >= items.len()) {
+            return Err(CONFLICT);
+          }
+          for (i, item) in items.iter().enumerate() {
+            self.snapshot(i, item, true)?;
+          }
         }
         done = true;
       }
@@ -450,6 +457,64 @@ mod tests {
       assert_eq!(text, "界 hello🦀 later end");
       assert_eq!(stream.usage, Some(Usage { input: 12, output: 8 }));
       assert_eq!(stream.output(), [reasoning.clone(), first.clone(), last.clone()]);
+    }
+  }
+
+  #[test]
+  fn usage_only_completion_preserves_finished_items_without_repeating_text() {
+    // Real Codex event order: the terminal response can have an empty output array.
+    for reasoning in [false, true] {
+      let i = usize::from(reasoning);
+      let id = format!("msg_{i}");
+      let mut reply = message(&id, &["BIRCH-EMBER"]);
+      reply["phase"] = json!("final_answer");
+      let mut wire = Vec::new();
+      let mut expected = Vec::new();
+      if reasoning {
+        let item =
+          json!({"type": "reasoning", "id": "rs_0", "summary": [], "encrypted_content": "final"});
+        wire.push(json!({"type": "response.output_item.done", "output_index": 0, "item": item}));
+        expected.push(item);
+      }
+      expected.push(reply.clone());
+      wire.extend([
+        json!({"type": "response.output_item.added", "output_index": i, "item": message(&id, &[])}),
+        json!({"type": "response.content_part.added", "output_index": i, "content_index": 0, "item_id": id, "part": {"type": "output_text", "text": ""}}),
+        delta(i, 0, "BIR"),
+        delta(i, 0, "CH-EMBER"),
+        json!({"type": "response.output_text.done", "output_index": i, "content_index": 0, "item_id": id, "text": "BIRCH-EMBER"}),
+        json!({"type": "response.content_part.done", "output_index": i, "content_index": 0, "item_id": id, "part": reply["content"][0]}),
+        json!({"type": "response.output_item.done", "output_index": i, "item": reply}),
+        complete(vec![]),
+      ]);
+      let mut stream = Stream::default();
+      let mut events = Vec::new();
+      for (i, event) in wire.iter().enumerate() {
+        assert_eq!(stream.event("", &event.to_string(), &mut events).unwrap(), i + 1 == wire.len());
+      }
+      let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+          Event::Text(text) => Some(text.as_str()),
+          _ => None,
+        })
+        .collect();
+      assert_eq!(text, "BIRCH-EMBER");
+      assert_eq!(stream.usage, Some(Usage { input: 12, output: 8 }));
+      assert_eq!(stream.output(), expected);
+    }
+  }
+
+  #[test]
+  fn usage_only_completion_rejects_unfinished_or_missing_items() {
+    for (i, done) in [(0, false), (1, true)] {
+      let mut stream = Stream::default();
+      let mut events = Vec::new();
+      let kind = if done { "response.output_item.done" } else { "response.output_item.added" };
+      let event = json!({"type": kind, "output_index": i, "item": message("msg", &["text"])});
+      stream.event("", &event.to_string(), &mut events).unwrap();
+      assert!(stream.event("", &complete(vec![]).to_string(), &mut events).is_err());
+      assert!(stream.usage.is_none());
     }
   }
 
