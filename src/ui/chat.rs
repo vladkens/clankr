@@ -109,6 +109,7 @@ struct App {
 
 impl App {
   fn new(backend: Box<dyn Backend>) -> Self {
+    let settings = backend.settings();
     Self {
       input: Input::default(),
       history: History::default(),
@@ -121,7 +122,7 @@ impl App {
       exit_deadline: None,
       draft_cleared: false,
       menu: None,
-      settings: Settings::default(),
+      settings,
       last_response: None,
       messages: Vec::new(),
     }
@@ -201,7 +202,11 @@ impl App {
         return Ok(Action::Copy);
       }
       Command::Model(Some(model)) => {
-        self.settings.select(model);
+        if self.backend.models().contains(model) {
+          self.settings.select(model);
+        } else {
+          self.notice = Some("This model is not connected to the current backend".into());
+        }
         self.input = self.history.reset();
       }
       Command::Effort(Some(effort)) if self.settings.model.efforts.contains(&effort) => {
@@ -214,7 +219,7 @@ impl App {
           self.input = Input::default();
           self.input.insert(prefix)?;
         }
-        self.menu = Menu::open(&self.input, self.settings);
+        self.menu = Menu::open(&self.input, self.settings, self.backend.models());
       }
     }
     Ok(Action::None)
@@ -394,7 +399,7 @@ impl App {
                 return self.command(command);
               }
               if kind == Kind::Commands {
-                self.menu = Menu::open(&self.input, self.settings);
+                self.menu = Menu::open(&self.input, self.settings, self.backend.models());
               }
               return Ok(Action::None);
             }
@@ -441,14 +446,14 @@ impl App {
           }
           if let Some(menu) = &mut self.menu {
             if !menu.refresh(&self.input, self.settings) {
-              self.menu = Menu::open(&self.input, self.settings);
+              self.menu = Menu::open(&self.input, self.settings, self.backend.models());
             }
           } else if matches!(key.code, KeyCode::Char('/' | '$' | ' '))
             && !key
               .modifiers
               .intersects(Mods::CONTROL | Mods::ALT | Mods::SUPER | Mods::HYPER | Mods::META)
           {
-            self.menu = Menu::open(&self.input, self.settings);
+            self.menu = Menu::open(&self.input, self.settings, self.backend.models());
           }
         }
       }
@@ -1020,7 +1025,7 @@ mod tests {
       for draft in ["unsent draft", " \n ", "first 界\ne\u{301} 👩‍💻", "/", "$"] {
         let mut app = App { has_session, ..App::default() };
         app.input.insert(draft).unwrap();
-        app.menu = Menu::open(&app.input, app.settings);
+        app.menu = Menu::open(&app.input, app.settings, app.backend.models());
         assert_eq!(app.menu.is_some(), matches!(draft, "/" | "$"));
         assert_eq!(app.event(key(KeyCode::Char('c'), Mods::CONTROL), 80).unwrap(), Action::None);
         assert_eq!(app.input, Input::default());
@@ -1080,6 +1085,24 @@ mod tests {
   }
 
   struct Script(Rc<RefCell<Peer>>);
+
+  #[test]
+  fn codex_starts_with_real_models_and_rejects_mock_provider_selections() {
+    let mut app = App::new(Box::new(agent::Codex::default()));
+    assert_eq!(app.settings.model.name, "gpt-6.1-sol");
+    assert!(!app.settings.fast);
+    app.command(Command::Model(None)).unwrap();
+    let menu = app.menu.as_ref().unwrap();
+    assert_eq!(
+      menu.items.iter().map(|item| item.name).collect::<Vec<_>>(),
+      ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"]
+    );
+    app.command(Command::Model(agent::model::Model::find("opus"))).unwrap();
+    assert_eq!(app.settings.model.name, "gpt-6.1-sol");
+    assert!(app.notice.as_deref().unwrap().contains("not connected"));
+    app.command(Command::Model(agent::model::Model::find("gpt-6-astra"))).unwrap();
+    assert_eq!(app.settings.model.name, "gpt-6-astra");
+  }
 
   impl Backend for Script {
     fn status(&self) -> agent::Status<'_> {

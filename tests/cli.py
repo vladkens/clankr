@@ -185,7 +185,7 @@ class Terminal:
 
         try:
             self.proc = subprocess.Popen(
-                [sys.executable, "-c", SUPERVISOR, str(notify), str(release), str(binary)],
+                [sys.executable, "-c", SUPERVISOR, str(notify), str(release), str(binary), "--mock"],
                 cwd=cwd, env=env, stdin=self.slave, stdout=self.slave, stderr=self.slave,
                 preexec_fn=controlling_terminal, pass_fds=(notify, release))
         except BaseException:

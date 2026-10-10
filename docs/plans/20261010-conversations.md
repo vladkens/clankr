@@ -1,6 +1,6 @@
 # Agents and conversations
 
-[Roadmap](../roadmap.md) · Future task · Depends on the prepared interface
+[Roadmap](../roadmap.md) · Current task · Uses the prepared interface
 
 ## Outcome
 
@@ -13,23 +13,26 @@ Replace echo with real Codex and Claude conversations in the existing TUI. Reque
 - `old:src/models.rs`: model catalog, selection, and effort capabilities.
 - `old:src/main.rs`: one-shot `ask` and session selection; `old:src/chat.rs`: request lifecycle and deferred settings persistence.
 
-Current integration points: `Backend` and captured `Prompt` in `src/agent.rs`, request handling in `src/chat.rs`, settings in `src/model.rs`, and the existing menus. The backend supplies events; terminal input and drawing retain one owner. Final module placement should follow the current code rather than reproduce the old file layout.
+Current integration points: `Backend` and captured `Prompt` in `src/agent/mod.rs`, request handling in `src/ui/chat.rs`, settings in `src/agent/model.rs`, and the existing menus. The backend supplies events; terminal input and drawing retain one owner.
 
 ## Work within this task
 
 ### Provider transport and conversation lifecycle
 
-- [ ] Connect Codex streaming to the normal TUI, then Claude with shared conversation history. Reuse the existing read-only authentication source; missing credentials produce a clear error. Add no login or token-refresh flow in this task.
-- [ ] Send completed conversation turns in the next request. Match SSE items and blocks correctly, decode UTF-8 strictly, handle EOF and provider errors, bound buffers, and redact credentials. Preserve received text on failure, including the last queued chunk; partial failures and cancellations must not become successful turns.
-- [ ] Keep the next draft editable. Capture text, model, options, and context at submission; allow only one active request. Esc cancels the active request, and exit waits for owned work to stop. Display actual provider usage rather than mock counters.
-- [ ] Preserve completed history without reprinting it while events arrive. Moving the cursor or changing the next request's settings must not redraw or alter the running response.
+- [x] Connect Codex streaming to the normal TUI. Read `CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or the existing `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) without login, token refresh, or credential writes. Keep `--mock` for offline interface checks.
+- [x] Replay completed Codex turns, including final encrypted reasoning and message phase. Reconcile indexed SSE snapshots and deltas, decode UTF-8 strictly, handle EOF and provider errors, bound buffers, and redact credentials. Drain received text before reporting an error; failed or cancelled turns do not enter conversation history.
+- [x] Keep the next draft and queued request settings independent of the running request. Esc cancels network work, exit stops the owned worker, and usage comes from the provider. Counts remain absent until reported.
+- [x] Preserve completed terminal history without reprinting it while events arrive. Provider events use the existing renderer and editor lifecycle.
+- [ ] Connect Claude through the same backend boundary and introduce shared conversation history for provider switching. Reuse read-only credentials and the same cancellation/error guarantees; do not add login or token refresh.
 
 ### Persistence and model settings
 
 - [ ] Save successful text conversations atomically and restore them on startup. Preserve private permissions, an exclusive lock, and the 16 MiB session limit. Retain the agreed `--session` and `CLANKR_HOME` selection behavior.
 - [ ] Read supported text history from `old`; reject corrupt files, unsupported formats, and unsupported tool/image blocks without overwriting them. Do not silently migrate old data. Checkpoint and attachment support arrive with their respective tasks.
 - [ ] Connect the existing model and effort menus to real provider capabilities. Preserve compatible effort, keep selections independent, save the next-turn choice after success/error/cancel, and define manual model IDs without pretending a local catalog proves API availability.
-- [ ] Verify model IDs, effort fields, and fast-mode support against current provider specifications. `old` has effort selection but no implemented fast/service-tier mapping; determine supported behavior before wiring the existing `/fast` toggle to requests. Custom models must not inherit another model's capabilities.
+- [ ] Extend verified model IDs, effort fields, and fast-mode capabilities to Claude and custom models. Codex effort and fast-mode mapping are connected; custom models must not inherit another model's capabilities.
+
+The Codex menu currently includes `gpt-6.1-sol`, `gpt-6-astra`, and `gpt-6-luna`, with effort levels and context limits checked against the installed Codex model catalog. Fast mode sends `service_tier: "priority"` and starts disabled. Full catalog discovery, custom IDs, Claude capabilities, and saved settings remain in this section. Authentication, HTTP, and stream parsing live in `src/agent/codex.rs` and `src/agent/stream.rs`; no session files are written yet.
 
 ### One-shot requests and unavailable models
 
@@ -38,6 +41,8 @@ Current integration points: `Backend` and captured `Prompt` in `src/agent.rs`, r
 - [ ] Retry only the failed call with its captured request. Do not duplicate history, received text, future tool side effects, or submit the next draft. Authentication and invalid-request errors must not loop; define behavior after partial output before implementation.
 
 ## Acceptance
+
+Codex integration verified on 2026-10-10: `make check`, 85 Rust tests, and the CLI `models` case passed. Loopback HTTP/SSE checks cover two-turn replay, partial EOF/provider failures, HTTP 401/429/503, credential redaction, cancellation/drop, and a full event queue. A real TUI conversation recalled a code from the preceding turn (provider usage: 40/5, then 67/9 input/output tokens); a third request with fast mode streamed and cancelled while preserving the next draft. Session restart and Claude acceptance remain outstanding.
 
 In the normal TUI, complete two turns, cancel another while editing the next draft, restart, and switch providers while retaining the supported conversation and settings. Exercise success and failure for both providers. `ask` streams through the same transport without session writes. Unavailable-model waiting is visible and cancellable.
 
