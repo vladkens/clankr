@@ -60,6 +60,9 @@ pub enum Event {
 // exactly one Finished, including after cancellation. The backend owns its work
 // and must stop it when dropped; it never writes to the terminal.
 pub trait Backend {
+  fn supports_skills(&self) -> bool {
+    false
+  }
   fn models(&self) -> &'static [Model] {
     MODELS
   }
