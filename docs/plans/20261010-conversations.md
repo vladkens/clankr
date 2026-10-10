@@ -42,8 +42,6 @@ The Codex menu currently includes `gpt-6.1-sol`, `gpt-6-astra`, and `gpt-6-luna`
 
 ## Acceptance
 
-Codex integration verified on 2026-10-10: `make check`, 85 Rust tests, and the CLI `models` case passed. Loopback HTTP/SSE checks cover two-turn replay, partial EOF/provider failures, HTTP 401/429/503, credential redaction, cancellation/drop, and a full event queue. A real TUI conversation recalled a code from the preceding turn (provider usage: 40/5, then 67/9 input/output tokens); a third request with fast mode streamed and cancelled while preserving the next draft. Session restart and Claude acceptance remain outstanding.
-
 In the normal TUI, complete two turns, cancel another while editing the next draft, restart, and switch providers while retaining the supported conversation and settings. Exercise success and failure for both providers. `ask` streams through the same transport without session writes. Unavailable-model waiting is visible and cancellable.
 
 Use a loopback HTTP/SSE server and temporary sessions for deterministic checks: UTF-8 splits, multiple items, partial output, EOF, 401/429/5xx, cancellation, saved-state failures, second writers, corrupt/oversized files, and credential redaction. A fixture must reproduce the historical SSE snapshot conflict in `old` before calling it fixed. Use focused App/transport tests; add a targeted PTY check for changed terminal behavior. Record live provider checks separately from fixtures.

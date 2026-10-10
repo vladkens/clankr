@@ -91,6 +91,7 @@ dependencies = [
  "osc8",
  "pulldown-latex",
  "reqwest",
+ "rustix",
  "rustls",
  "serde_json",
  "syntect",

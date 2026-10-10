@@ -1,10 +1,12 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue};
+use rustix::fs::{Mode, OFlags};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
@@ -20,7 +22,7 @@ const SESSION: Error =
 const HISTORY: Error = Error::Provider("Conversation exceeds 16 MiB; use /clear to start again");
 
 pub struct Codex {
-  history: Vec<Value>,
+  history: Arc<Vec<Value>>,
   usage: Option<Usage>,
   running: Option<Running>,
   error: Option<Error>,
@@ -30,10 +32,14 @@ pub struct Codex {
 
 struct Running {
   events: mpsc::Receiver<Event>,
-  worker: JoinHandle<Res<Reply>>,
+  worker: JoinHandle<Res<Completed>>,
   cancel: Option<oneshot::Sender<()>>,
-  prompt: Value,
   cancelled: bool,
+}
+
+struct Completed {
+  history: Arc<Vec<Value>>,
+  usage: Option<Usage>,
 }
 
 struct Reply {
@@ -44,7 +50,7 @@ struct Reply {
 impl Default for Codex {
   fn default() -> Self {
     Self {
-      history: Vec::new(),
+      history: Arc::default(),
       usage: None,
       running: None,
       error: None,
@@ -62,10 +68,7 @@ impl Codex {
     if !prompt.skills.is_empty() {
       return Err(Error::Provider("Skills are not connected yet"));
     }
-    let message = json!({"role": "user", "content": [{"type": "input_text", "text": prompt.text}]});
-    let mut input = self.history.clone();
-    input.push(message.clone());
-    let body = body(&prompt.settings, input)?;
+    let history = Arc::clone(&self.history);
     let (sender, events) = mpsc::channel(64);
     let (cancel, cancelled) = oneshot::channel();
     let url = self.url.clone();
@@ -76,15 +79,24 @@ impl Codex {
         tokio::select! {
           biased;
           _ = cancelled => Err(Error::Cancelled),
-          reply = request(&url, body, auth, sender) => reply,
+          reply = async {
+            let mut input = history.as_ref().clone();
+            input.push(json!({"role": "user", "content": [{"type": "input_text", "text": prompt.text}]}));
+            let body = body(&prompt.settings, &input)?;
+            let reply = request(&url, body, auth, sender).await?;
+            input.extend(reply.output);
+            if serde_json::to_vec(&input).map_err(|_| HISTORY)?.len() > LIMIT {
+              return Err(HISTORY);
+            }
+            Ok(Completed { history: Arc::new(input), usage: reply.usage })
+          } => reply,
         }
       });
       // Dropping the request closes its socket. Do not wait for an OS DNS lookup.
       runtime.shutdown_background();
       result
     })?;
-    self.running =
-      Some(Running { events, worker, cancel: Some(cancel), prompt: message, cancelled: false });
+    self.running = Some(Running { events, worker, cancel: Some(cancel), cancelled: false });
     Ok(())
   }
 }
@@ -130,16 +142,9 @@ impl Backend for Codex {
     let result = if running.cancelled {
       Err(Error::Cancelled)
     } else {
-      reply.and_then(|reply| {
-        let mut history = self.history.clone();
-        history.push(running.prompt);
-        history.extend(reply.output);
-        if serde_json::to_vec(&history).map_err(|_| HISTORY)?.len() > LIMIT {
-          return Err(HISTORY);
-        }
-        self.history = history;
+      reply.map(|reply| {
+        self.history = reply.history;
         self.usage = reply.usage;
-        Ok(())
       })
     };
     Some(Event::Finished(result))
@@ -159,7 +164,7 @@ impl Backend for Codex {
     if let Some(running) = self.running.take() {
       let _ = running.worker.join();
     }
-    self.history.clear();
+    self.history = Arc::default();
     self.usage = None;
     self.error = None;
   }
@@ -171,7 +176,7 @@ impl Drop for Codex {
   }
 }
 
-fn body(settings: &Settings, input: Vec<Value>) -> Res<Vec<u8>> {
+fn body(settings: &Settings, input: &[Value]) -> Res<Vec<u8>> {
   let mut body = json!({
     "model": settings.model.name,
     "instructions": "Be concise, accurate and practical. Reply in the user's language.",
@@ -254,7 +259,10 @@ fn credentials() -> Res<HeaderMap> {
 }
 
 fn session(path: &Path, id: Option<&str>) -> Res<HeaderMap> {
-  let file = File::open(path).map_err(|_| SESSION)?;
+  let file =
+    rustix::fs::open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
+      .map(File::from)
+      .map_err(|_| SESSION)?;
   let meta = file.metadata().map_err(|_| SESSION)?;
   if !meta.is_file() || meta.len() > SESSION_LIMIT {
     return Err(SESSION);
@@ -301,7 +309,7 @@ mod tests {
   }
 
   fn client(url: String) -> Codex {
-    Codex { url, auth, history: Vec::new(), usage: None, running: None, error: None }
+    Codex { url, auth, history: Arc::default(), usage: None, running: None, error: None }
   }
 
   fn read(socket: &mut TcpStream) -> Value {
@@ -424,18 +432,54 @@ mod tests {
       (200, answer("recovered")),
     ];
     let (mut codex, requests, server) = server(replies);
+    codex.history = Arc::new(vec![json!({"role": "user", "content": "saved"})]);
+    codex.usage = Some(Usage { input: 10, output: 2 });
+    let history = Arc::clone(&codex.history);
     for expected in ["last received chunk", "partial EOF", "", "", ""] {
       send(&mut codex, "failed question");
       let (text, _, result) = finish(&mut codex);
       assert_eq!(text, expected);
       assert!(!result.unwrap_err().to_string().contains("private"));
-      assert!(codex.history.is_empty());
+      assert!(Arc::ptr_eq(&codex.history, &history));
+      assert_eq!(codex.usage, Some(Usage { input: 10, output: 2 }));
       requests.recv().unwrap();
     }
     send(&mut codex, "new question");
     finish(&mut codex).2.unwrap();
-    assert_eq!(requests.recv().unwrap()["input"].as_array().unwrap().len(), 1);
+    assert_eq!(requests.recv().unwrap()["input"].as_array().unwrap().len(), 2);
     server.join().unwrap();
+  }
+
+  #[test]
+  fn history_limits_and_cancellation_after_completion_preserve_the_previous_turn() {
+    for oversized in [false, true] {
+      let response = if oversized { "x".repeat(2048) } else { "next".into() };
+      let (mut codex, requests, server) = server(vec![(200, answer(&response))]);
+      let text = "x".repeat(if oversized { LIMIT - 1024 } else { 1 });
+      codex.history = Arc::new(vec![json!({"role": "user", "content": text})]);
+      codex.usage = Some(Usage { input: 10, output: 2 });
+      let history = Arc::clone(&codex.history);
+      send(&mut codex, "next");
+      if !oversized {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !codex.running.as_ref().unwrap().worker.is_finished() {
+          assert!(Instant::now() < deadline);
+          thread::sleep(Duration::from_millis(1));
+        }
+        codex.cancel();
+      }
+      let error = finish(&mut codex).2.unwrap_err();
+      assert_eq!(error.to_string(), if oversized { HISTORY } else { Error::Cancelled }.to_string());
+      assert!(Arc::ptr_eq(&codex.history, &history));
+      assert_eq!(codex.usage, Some(Usage { input: 10, output: 2 }));
+      assert!(requests.recv().is_ok());
+      server.join().unwrap();
+
+      send(&mut codex, &"x".repeat(LIMIT));
+      assert_eq!(finish(&mut codex).2.unwrap_err().to_string(), HISTORY.to_string());
+      assert!(Arc::ptr_eq(&codex.history, &history));
+      assert_eq!(codex.usage, Some(Usage { input: 10, output: 2 }));
+    }
   }
 
   #[test]
@@ -495,6 +539,25 @@ mod tests {
     File::options().write(true).open(&path).unwrap().set_len(SESSION_LIMIT + 1).unwrap();
     assert!(session(&path, None).is_err());
     std::fs::remove_file(&path).unwrap();
+  }
+
+  #[test]
+  fn a_session_fifo_is_rejected_without_waiting_for_a_writer() {
+    let path = std::env::temp_dir().join(format!("clankr-auth-{}.fifo", fastrand::u64(..)));
+    assert!(std::process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+    let file = path.clone();
+    let (send, received) = sync::channel();
+    let worker = thread::spawn(move || send.send(session(&file, None).is_err()).unwrap());
+    let rejected = received.recv_timeout(Duration::from_secs(1));
+    // Unblock a regressed blocking open before joining, so a failure cannot hang the suite.
+    let writer = rejected.is_err().then(|| {
+      rustix::fs::open(&path, OFlags::RDWR | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
+        .unwrap()
+    });
+    worker.join().unwrap();
+    drop(writer);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(rejected, Ok(true));
   }
 
   #[test]
