@@ -22,6 +22,11 @@ panic = "abort"
 strip = false
 lto = false
 
+# The prebuilt binaries of `make dist`: file and line in backtraces at a smaller size.
+[profile.dist]
+inherits = "release"
+debug = "line-tables-only"
+
 [dependencies]
 arboard = { version = "3.6.1", default-features = false }
 crossterm = "0.29.0"
