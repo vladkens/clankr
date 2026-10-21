@@ -34,11 +34,6 @@ test-cli: # the terminal scenarios of tests/cli.py on the release binary; CASE=<
 run: # build and start the CLI on a cleared screen
 	cargo build -r && clear && ./target/release/clankr
 
-# Prebuilt binaries as target/distrib/clankr-dev-<target>.tar.gz (.zip for Windows), from an Apple
-# Silicon Mac: Linux (glibc 2.28) and Windows through cargo-cross, installed at a fixed version,
-# with its toolchains kept in ~/.cache/cargo-cross (CI caches that folder).
-# macOS keeps its file and line info in clankr.dSYM, which has to stay next to the binary. Not
-# target/dist: cargo keeps the dist profile's build scripts there.
 dist: T := $(or $(CARGO_TARGET_DIR),target)
 dist: # the release archives for CI (vladkens/actions/rust-build)
 	cargo install --locked cargo-cross@1.6.0
