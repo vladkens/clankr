@@ -1,4 +1,4 @@
-.PHONY: prepare check test test-cli build update clean run
+.PHONY: prepare check test build update clean
 
 CARGO_FLAGS := --release --locked
 
@@ -15,13 +15,9 @@ check:
 test:
 	cargo test $(CARGO_FLAGS)
 
-test-cli:
-	cargo build $(CARGO_FLAGS)
-	uv run tests/cli.py --bin target/release/clankr $(if $(CASE),--case $(CASE))
-
 build:
 	cargo build $(CARGO_FLAGS)
-	ls -lh target/release/$(shell basename $(CURDIR))
+	ls -lh target/release/clankr
 
 update:
 	cargo upgrade -i
@@ -29,5 +25,11 @@ update:
 clean:
 	cargo clean
 
-run:
+.PHONY: test-cli run
+
+test-cli: # the terminal scenarios of tests/cli.py on the release binary; CASE=<case> runs one
+	cargo build $(CARGO_FLAGS)
+	uv run tests/cli.py --bin target/release/clankr $(if $(CASE),--case $(CASE))
+
+run: # build and start the CLI on a cleared screen
 	cargo build -r && clear && ./target/release/clankr
