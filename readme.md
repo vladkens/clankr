@@ -19,3 +19,7 @@ Claude Code and Codex are heavy, update too often, and have a complex set of rul
 - Image attachments from files and the clipboard.
 - Saved, resumable conversations.
 - Automatic retries when models are busy or rate-limited.
+
+## Contributing
+
+Pull requests are welcome, including ones made with agents: point yours at [agents.md](agents.md).
