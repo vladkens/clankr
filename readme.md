@@ -22,7 +22,7 @@ Claude Code and Codex are heavy, update too often, and have a complex set of rul
 
 ## 🤖 How it's made
 
-clankr is written by AI agents (Claude Code, Codex) following [agents.md](agents.md); I choose what to build and review every pull request. CI drives the release binary in a pseudo-terminal through scripted sessions with a mock model (menus, streamed Markdown, model switching, the queue) and checks the escape sequences it writes, the transcript and the terminal state it leaves ([tests/cli.py](tests/cli.py)). I've written software by hand for years ([macmon](https://github.com/vladkens/macmon), [twscrape](https://github.com/vladkens/twscrape), [ecloop](https://github.com/vladkens/ecloop)); agents are how I build now. Releases are rare, and an update doesn't break what you rely on: the CLI, the config and your data stay compatible; a breaking change waits for a major version.
+clankr is built with AI agents following [agents.md](agents.md); I decide what to build and review every change. I've written software by hand for years ([macmon](https://github.com/vladkens/macmon), [twscrape](https://github.com/vladkens/twscrape), [ecloop](https://github.com/vladkens/ecloop)). Releases are rare and keep your config and data working.
 
 ## Contributing
 
