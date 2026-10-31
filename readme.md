@@ -19,3 +19,11 @@ Claude Code and Codex are heavy, update too often, and have a complex set of rul
 - Image attachments from files and the clipboard.
 - Saved, resumable conversations.
 - Automatic retries when models are busy or rate-limited.
+
+## 🤖 How it's made
+
+clankr is built with AI agents following [agents.md](agents.md): I choose what to build, review the changes and test them on real machines. Before agents, I wrote software by hand for years ([macmon](https://github.com/vladkens/macmon), [twscrape](https://github.com/vladkens/twscrape), [ecloop](https://github.com/vladkens/ecloop)). Releases are rare on purpose: I'd rather test and polish a set of changes than ship each one as it lands, and I try not to break your config or data.
+
+## Contributing
+
+Pull requests are welcome, including ones made with agents: point yours at [agents.md](agents.md).
