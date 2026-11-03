@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use super::input::Input;
 use crate::Res;
-use crate::agent::model::{Effort, MODELS, Model, Settings};
+use crate::agent::model::{Effort, Model, Settings};
 
 pub const VISIBLE: usize = 6;
 
@@ -54,11 +54,11 @@ impl Kind {
     }
   }
 
-  fn items(self, settings: Settings) -> Vec<Item> {
+  fn items(self, settings: Settings, models: &'static [Model]) -> Vec<Item> {
     match self {
       Self::Commands => COMMANDS.to_vec(),
       Self::Skills => SKILLS.to_vec(),
-      Self::Models => MODELS
+      Self::Models => models
         .iter()
         .map(|model| Item {
           name: model.name,
@@ -136,13 +136,14 @@ pub struct Menu {
   pub settings: Settings,
   range: Range<usize>,
   query: String,
+  models: &'static [Model],
 }
 
 impl Menu {
-  pub fn open(input: &Input, settings: Settings) -> Option<Self> {
+  pub fn open(input: &Input, settings: Settings, models: &'static [Model]) -> Option<Self> {
     let (kind, range, query) = target(input)?;
-    let items = search(kind, &query, settings);
-    let mut menu = Self { kind, items, selected: 0, offset: 0, settings, range, query };
+    let items = search(kind, &query, settings, models);
+    let mut menu = Self { kind, items, selected: 0, offset: 0, settings, range, query, models };
     menu.select_current();
     Some(menu)
   }
@@ -153,7 +154,7 @@ impl Menu {
       return false;
     }
     if query != self.query || settings != self.settings {
-      self.items = search(kind, &query, settings);
+      self.items = search(kind, &query, settings, self.models);
       self.query = query;
       self.settings = settings;
       self.select_current();
@@ -271,9 +272,9 @@ fn target(input: &Input) -> Option<(Kind, Range<usize>, String)> {
   Some((Kind::Skills, start..end, query.to_lowercase()))
 }
 
-fn search(kind: Kind, query: &str, settings: Settings) -> Vec<Item> {
+fn search(kind: Kind, query: &str, settings: Settings, models: &'static [Model]) -> Vec<Item> {
   let mut items: Vec<_> = kind
-    .items(settings)
+    .items(settings, models)
     .into_iter()
     .filter_map(|item| {
       let name = item.name.trim_start_matches('/');
@@ -299,6 +300,7 @@ fn search(kind: Kind, query: &str, settings: Settings) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::agent::model::MODELS;
 
   fn input(text: &str) -> Input {
     let mut input = Input::default();
@@ -308,14 +310,14 @@ mod tests {
 
   #[test]
   fn commands_and_skills_are_separate_and_only_the_current_token_is_completed() {
-    let commands = Menu::open(&input("/"), Settings::default()).unwrap();
+    let commands = Menu::open(&input("/"), Settings::default(), MODELS).unwrap();
     assert_eq!(
       commands.items.iter().map(|x| x.name).collect::<Vec<_>>(),
       ["/clear", "/quit", "/model", "/effort", "/fast", "/copy"]
     );
     let mut draft = input("до $age after");
     draft.pos = "до $age".len();
-    let mut menu = Menu::open(&draft, Settings::default()).unwrap();
+    let mut menu = Menu::open(&draft, Settings::default(), MODELS).unwrap();
     assert_eq!(menu.kind, Kind::Skills);
     assert!(menu.items.iter().all(|x| !x.name.starts_with('/')));
     menu.step(true);
@@ -323,7 +325,7 @@ mod tests {
     assert_eq!(draft.text, "до $agent-rules after");
     assert_eq!(draft.skills[0].name, "agent-rules");
     assert_eq!(&draft.text[draft.skills[0].range.clone()], "$agent-rules");
-    assert!(Menu::open(&draft, Settings::default()).is_none());
+    assert!(Menu::open(&draft, Settings::default(), MODELS).is_none());
   }
 
   #[test]
@@ -339,9 +341,9 @@ mod tests {
       "$age?",
       "$age text",
     ] {
-      assert!(Menu::open(&input(text), Settings::default()).is_none(), "{text}");
+      assert!(Menu::open(&input(text), Settings::default(), MODELS).is_none(), "{text}");
     }
-    assert!(Menu::open(&input("`code` then $age"), Settings::default()).is_some());
+    assert!(Menu::open(&input("`code` then $age"), Settings::default(), MODELS).is_some());
     assert_eq!(Command::parse("/clear "), Some(Command::Clear));
     assert_eq!(Command::parse("/clear\n"), None);
   }
@@ -349,7 +351,7 @@ mod tests {
   #[test]
   fn navigation_wraps_in_both_directions_and_keeps_selection_visible() {
     for text in ["/", "$", "$age", "$rust", "$zzzz", "/model ", "/effort "] {
-      let mut menu = Menu::open(&input(text), Settings::default()).unwrap();
+      let mut menu = Menu::open(&input(text), Settings::default(), MODELS).unwrap();
       let count = menu.items.len();
       let initial = menu.selected;
       for down in [true, false] {
@@ -371,11 +373,11 @@ mod tests {
 
   #[test]
   fn filtering_scrolls_and_empty_results_do_not_choose_a_command() {
-    let fuzzy = Menu::open(&input("$aget"), Settings::default()).unwrap();
+    let fuzzy = Menu::open(&input("$aget"), Settings::default(), MODELS).unwrap();
     assert_eq!(fuzzy.items[0].name, "agent-intervention");
     assert_eq!(fuzzy.items[1].name, "agent-rules");
     let mut draft = input("$");
-    let mut menu = Menu::open(&draft, Settings::default()).unwrap();
+    let mut menu = Menu::open(&draft, Settings::default(), MODELS).unwrap();
     for _ in 1..SKILLS.len() {
       menu.step(true);
     }

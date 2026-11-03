@@ -1108,7 +1108,9 @@ mod tests {
     });
     let mut input = Input::default();
     input.insert("before $").unwrap();
-    let mut menu = Menu::open(&input, crate::agent::model::Settings::default()).unwrap();
+    let mut menu =
+      Menu::open(&input, crate::agent::model::Settings::default(), crate::agent::model::MODELS)
+        .unwrap();
     for _ in 0..7 {
       menu.step(true);
     }
@@ -1245,7 +1247,9 @@ mod tests {
 
     input = Input::default();
     input.insert("$").unwrap();
-    let menu = Menu::open(&input, crate::agent::model::Settings::default()).unwrap();
+    let menu =
+      Menu::open(&input, crate::agent::model::Settings::default(), crate::agent::model::MODELS)
+        .unwrap();
     let lines = texts(footer(&Frame { menu: Some(&menu), ..frame(&input) }, 40, 12).0);
     assert_eq!(lines[..3], [&rule, "$", &rule]);
     assert!(lines[3].starts_with("Skills 8") && lines[3].ends_with("1–5"));

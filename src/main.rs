@@ -21,10 +21,23 @@ enum Error {
   ResponseTooLarge,
   #[error("Cancelled")]
   Cancelled,
+  #[error("{0}")]
+  Provider(&'static str),
+  #[error("Codex HTTP {0}")]
+  Http(u16),
 }
 
 fn main() {
-  if let Err(error) = ui::run(Box::new(agent::Echo::default())) {
+  let args: Vec<_> = std::env::args_os().skip(1).collect();
+  let backend: Box<dyn agent::Backend> = if args.is_empty() {
+    Box::new(agent::Codex::default())
+  } else if args.len() == 1 && args[0] == "--mock" {
+    Box::new(agent::Echo::default())
+  } else {
+    eprintln!("Usage: clankr [--mock]");
+    std::process::exit(2);
+  };
+  if let Err(error) = ui::run(backend) {
     ui::report(&error);
     std::process::exit(1);
   }

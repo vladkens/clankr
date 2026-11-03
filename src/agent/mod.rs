@@ -1,8 +1,11 @@
+mod codex;
 mod echo;
 pub mod model;
+mod stream;
 
+pub use codex::Codex;
 pub use echo::Echo;
-use model::Settings;
+use model::{MODELS, Model, Settings};
 
 use crate::Res;
 
@@ -57,6 +60,15 @@ pub enum Event {
 // exactly one Finished, including after cancellation. The backend owns its work
 // and must stop it when dropped; it never writes to the terminal.
 pub trait Backend {
+  fn supports_skills(&self) -> bool {
+    false
+  }
+  fn models(&self) -> &'static [Model] {
+    MODELS
+  }
+  fn settings(&self) -> Settings {
+    Settings::default()
+  }
   fn status(&self) -> Status<'_>;
   fn start(&mut self, prompt: Prompt);
   fn poll(&mut self) -> Option<Event>;

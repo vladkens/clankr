@@ -185,7 +185,7 @@ class Terminal:
 
         try:
             self.proc = subprocess.Popen(
-                [sys.executable, "-c", SUPERVISOR, str(notify), str(release), str(binary)],
+                [sys.executable, "-c", SUPERVISOR, str(notify), str(release), str(binary), "--mock"],
                 cwd=cwd, env=env, stdin=self.slave, stdout=self.slave, stderr=self.slave,
                 preexec_fn=controlling_terminal, pass_fds=(notify, release))
         except BaseException:
@@ -273,8 +273,12 @@ class Terminal:
         self.send(ESC + "[200~" + value + ESC + "[201~")
 
     def menu(self, title):
-        self.until(lambda: title in self.display and "esc close" in self.display
-                   and self.screen.display[self.screen.cursor.y + 1].startswith("─"), title)
+        def opened():
+            rows = self.screen.display[self.screen.cursor.y + 1:]
+            return (len(rows) > 1 and rows[0].startswith("─")
+                    and rows[1].startswith(title) and any("esc close" in row for row in rows))
+
+        self.until(opened, title)
 
     def edited(self, expected):
         """Check the draft in the real PTY, then clear it without a mock round trip."""
@@ -761,10 +765,14 @@ def models(binary):
     lower, higher = ESC + "[44;5u", ESC + "[46;5u"
 
     def selected(value):
-        terminal.until(lambda: "auto · " + value in terminal.display
-                       and "esc close" not in terminal.display
-                       and terminal.screen.display[terminal.screen.cursor.y].rstrip() == "",
-                       "selected " + value)
+        def applied():
+            # Unsupported reflow can retain an old menu above the active editor.
+            rows = terminal.screen.display[terminal.screen.cursor.y:]
+            return (len(rows) > 2 and rows[0].rstrip() == "" and rows[1].startswith("─")
+                    and rows[2].startswith("auto · " + value)
+                    and not any("esc close" in row for row in rows[1:]))
+
+        terminal.until(applied, "selected " + value)
 
     try:
         terminal.ready()

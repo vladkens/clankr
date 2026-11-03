@@ -80,6 +80,10 @@ impl Echo {
 }
 
 impl Backend for Echo {
+  fn supports_skills(&self) -> bool {
+    true
+  }
+
   fn status(&self) -> Status<'_> {
     Status { mode: "auto", context: (self.context > 0).then_some((self.context, 272_000)) }
   }
